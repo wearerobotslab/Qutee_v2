@@ -9,7 +9,7 @@ The rest of this Readme assumes that you are in the `Qutee_v2/software` folder.
 ## Docker build environment:
 Build the docker container qutee_idf that we use as a build environment: 
 ```
-docker build -t qutee_idf Docker/.
+docker build -t qutee_idf docker/.
 ```
 
 Then, launch and shell into the qutee_idf container: 
