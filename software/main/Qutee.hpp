@@ -23,7 +23,7 @@
 #include "nvs.h"
 #define STORAGE_NAMESPACE "storage"
 
-#include "arduino.h"
+#include "Arduino.h"
 #include <Wire.h>
 
 #include <Adafruit_Sensor.h>
@@ -74,6 +74,7 @@ public:
   std::string get_name(){return this->name;}
   void checkup();
   void menu();
+  void tft_status(const char* msg, uint16_t color = ST77XX_WHITE);
 private:
   void send_actions(const Actions_t& actions);
   void get_motor_positions(State_t& state_ref, size_t offset);
@@ -94,6 +95,8 @@ private:
   void set_tft_brightness(size_t value);
   std::vector<std::string>  get_name_list();
   void select_name();
+  bool wait_button_press();
+  void enter_ros_mode();
   void name_memory(size_t * id, bool write);
   
   // ----- Attributes ---- //
@@ -109,7 +112,9 @@ private:
   Dynamixel2Arduino _dxl;
   Adafruit_ST7789 _tft;
   Adafruit_BNO055 _bno;
+  bool _imu_available = false; // false when no BNO055 is detected at init; IMU readings are then zeros
   Adafruit_MAX17048 _maxlipo;
+  bool _battery_monitor_available = false; // false when no MAX17048 is detected at init; battery_voltage() then returns 0
   
   
   

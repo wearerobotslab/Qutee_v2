@@ -10,7 +10,7 @@ ARG TZ_ARG=UTC
 ENV TZ=$TZ_ARG
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-RUN . $IDF_PATH/export.sh && pip --no-cache-dir install catkin_pkg lark-parser colcon-common-extensions importlib-resources
+RUN . $IDF_PATH/export.sh && pip --no-cache-dir install catkin_pkg lark "empy<4" colcon-common-extensions importlib-resources
 
 ARG USER_ID=espidf
 

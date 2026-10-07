@@ -7,8 +7,18 @@
 #define LEDC_CHANNEL            LEDC_CHANNEL_0
 #define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
 #define LEDC_FREQUENCY          (4000) // Frequency in Hertz. Set frequency at 4 kHz
+#define TFT_BRIGHTNESS          0.5 // backlight duty cycle, from 0 (off) to 1 (full)
 
 
+
+// Buttons: the Reverse TFT Feather has D0 (active low), D1 and D2 (active high).
+// The regular ESP32-S3 TFT Feather only has D0 (Boot), so its menus use short presses (next) and long presses (select).
+#if TFT_I2C_POWER == 7 // adafruit_feather_esp32s3_reversetft
+#define QUTEE_THREE_BUTTONS 1
+#else
+#define QUTEE_THREE_BUTTONS 0
+#endif
+#define LONG_PRESS_US 700000
 
 #define VALUE(string) #string
 #define TO_LITERAL(string) VALUE(string)
@@ -77,15 +87,18 @@ void Qutee::init(){
   init_imu();
 
   // init battery monitor
-  if (!this->_maxlipo.begin()) {
-    ESP_LOGI("BATTERY: ","Couldnt find Adafruit MAX17048?\nMake sure a battery is plugged in!\n");
-    while (1) 
-        std::this_thread::sleep_for(std::chrono::microseconds(100000));
+  if (this->_maxlipo.begin()) {
+    this->_battery_monitor_available = true;
+    ESP_LOGI("BATTERY: ","Found MAX17048 with Chip ID: %d \n",  this->_maxlipo.getChipID());
+    this->_maxlipo.reset();
   }
-  
-  ESP_LOGI("BATTERY: ","Found MAX17048 with Chip ID: %d \n",  this->_maxlipo.getChipID());
-  this->_maxlipo.reset();
-  
+  else {
+    ESP_LOGW("BATTERY: ","Couldnt find Adafruit MAX17048, continuing without battery monitor (battery voltage will read as 0)");
+    this->tft_status("No battery monitor, continuing", ST77XX_YELLOW);
+    delay(1000);
+  }
+
+  this->tft_status("Setting up motors...");
   init_motors();
   scan();
   tft_init_data_screen();
@@ -94,18 +107,33 @@ void Qutee::init(){
 
 void Qutee::init_imu(){
 
-  Wire.setPins(GPIO_NUM_3,GPIO_NUM_4);
+  // I2C pins and power pin come from the board variant (CONFIG_ARDUINO_VARIANT)
+  Wire.setPins(SDA, SCL);
   Wire.begin();
 
   // POWER UP I2C
-  gpio_set_direction(GPIO_NUM_7, GPIO_MODE_OUTPUT);
-  gpio_set_level(GPIO_NUM_7, 1);
+  gpio_set_direction((gpio_num_t)TFT_I2C_POWER, GPIO_MODE_OUTPUT);
+  gpio_set_level((gpio_num_t)TFT_I2C_POWER, 1);
+  delay(10);
+  // List the I2C devices that answer (BNO055 is 0x28/0x29, battery monitor is 0x36 for MAX17048 or 0x0b for LC709203F)
+  int nb_i2c_devices = 0;
+  for(uint8_t addr = 1; addr < 127; addr++){
+    Wire.beginTransmission(addr);
+    if(Wire.endTransmission() == 0){
+      ESP_LOGI("I2C","Device found at 0x%02x", addr);
+      nb_i2c_devices++;
+    }
+  }
+  ESP_LOGI("I2C","%i device(s) found on SDA=GPIO%d SCL=GPIO%d", nb_i2c_devices, SDA, SCL);
   ESP_LOGI("IMU","START IMU PROCESS.");
   if (!this->_bno.begin())
     {
-      ESP_LOGI("IMU","No BNO055 detected");
-      while (1);
+      ESP_LOGW("IMU","No BNO055 detected, continuing without IMU (orientation and acceleration will read as zero)");
+      this->tft_status("IMU not found, continuing without it", ST77XX_YELLOW);
+      delay(1000);
+      return;
     }
+  this->_imu_available = true;
   ESP_LOGI("IMU","Init imu Done");
   delay(1000);
   ESP_LOGI("IMU","Setting NDOF mode");
@@ -136,7 +164,7 @@ void Qutee::init_tft(){
   ledc_channel.timer_sel      = LEDC_TIMER;
   ledc_channel.intr_type      = LEDC_INTR_DISABLE;
   ledc_channel.gpio_num       = (gpio_num_t)TFT_BACKLITE;
-  ledc_channel.duty           = 0.05*8192; // Set duty to 5%
+  ledc_channel.duty           = TFT_BRIGHTNESS*8192;
   ledc_channel.hpoint         = 0;
 
   ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
@@ -170,7 +198,18 @@ void Qutee::tft_load_screen() {
   this->_tft.println(this->name.c_str());
   this->_tft.setTextColor(ST77XX_RED);
   this->_tft.println("Loading!");
+  this->tft_status("Powered on");
   delay(1000);
+}
+
+// Show a one-line status message at the bottom of the screen (below the data screen's last row)
+void Qutee::tft_status(const char* msg, uint16_t color) {
+  this->_tft.fillRect(0, 128, 240, 8, ST77XX_BLACK);
+  this->_tft.setTextWrap(false);
+  this->_tft.setTextSize(1);
+  this->_tft.setTextColor(color, ST77XX_BLACK);
+  this->_tft.setCursor(0, 128);
+  this->_tft.print(msg);
 }
 
 void Qutee::tft_init_data_screen() {
@@ -345,6 +384,8 @@ void Qutee::calibration()
 // Return the battery's voltage. Given that we use NIMH batteries, the voltage can exceed 5.14V, which is the maximum value that the battery monitor can report. When this happens, the monitor return unexpectedly low values (e.g., 0.01V, or 2.1V). Therefore, this function return 5.15V when the measured value is below 3.5V. 
 float Qutee::battery_voltage()
 {
+  if (!this->_battery_monitor_available)
+    return 0.0f;
   float voltage = this->_maxlipo.cellVoltage();
   if (voltage<3.5)
     {
@@ -368,6 +409,10 @@ void Qutee::scan()
       }
   }   
   ESP_LOGI("DXL: ","Total %i DYNAMIXEL(s) found!\n",found_dynamixel );
+  char msg[32];
+  snprintf(msg, sizeof(msg), "Motors found: %i/%i", found_dynamixel, DXL_ID_CNT);
+  this->tft_status(msg, found_dynamixel == DXL_ID_CNT ? ST77XX_GREEN : ST77XX_YELLOW);
+  delay(1000);
 }
 
 void Qutee::init_motors()
@@ -423,10 +468,12 @@ void Qutee::displaySensorStatus(void)
 
 void Qutee::get_state(State_t& state_ref)
 {    
-  sensors_event_t orientationData , linearAccelData;
-  this->_bno.getEvent(&orientationData, Adafruit_BNO055::VECTOR_EULER);
-  //  bno.getEvent(&angVelData, Adafruit_BNO055::VECTOR_GYROSCOPE);
-  this->_bno.getEvent(&linearAccelData, Adafruit_BNO055::VECTOR_LINEARACCEL);
+  sensors_event_t orientationData = {}, linearAccelData = {};
+  if(this->_imu_available){
+    this->_bno.getEvent(&orientationData, Adafruit_BNO055::VECTOR_EULER);
+    //  bno.getEvent(&angVelData, Adafruit_BNO055::VECTOR_GYROSCOPE);
+    this->_bno.getEvent(&linearAccelData, Adafruit_BNO055::VECTOR_LINEARACCEL);
+  }
   
   state_ref.setValues({{this->DEG_2_RAD * orientationData.orientation.x},
                   {this->DEG_2_RAD * orientationData.orientation.y},
@@ -538,9 +585,11 @@ void Qutee::checkup(){
     er[i]=0;
 			
   this->tft_init_checkup_screen();
-  
-  while(1)
-  {  
+  this->tft_status("Press button to exit");
+  while(!gpio_get_level(GPIO_NUM_0)) delay(10); // wait for the button that started the checkup to be released
+
+  while(gpio_get_level(GPIO_NUM_0)) // D0 (active low) exits the checkup
+  {
     start = esp_timer_get_time();
     this->get_motor_positions(state,6);
 
@@ -567,43 +616,42 @@ void Qutee::checkup(){
       ESP_LOGE("Checkup"," Error: loop duration: %" PRId64" longer than period: ", esp_timer_get_time() - start);
   }
   ESP_LOGI("Checkup", "duration of the loop: %" PRId64, esp_timer_get_time() - start_loop);
+  go_to_neutral_pose();
+  while(!gpio_get_level(GPIO_NUM_0)) delay(10); // wait for release, so the menu doesn't see this press
+  delay(50); // debounce
  }
 
-void Qutee::tft_init_checkup_screen() {
-  int lo = 10; // line offset
-  int io = 32; // item offset
-  this->_tft.fillScreen(ST77XX_BLACK);
-  this->_tft.setCursor(0, 0);
-  this->_tft.setTextColor(ST77XX_GREEN,ST77XX_BLACK);
-  this->_tft.setTextSize(1);
-  this->_tft.setCursor(0, 0);    this->_tft.setTextColor(ST77XX_RED,ST77XX_BLACK);    this->_tft.println("Error: ");
+// Checkup screen layout (text size 2, 12x16 px characters): one row per leg, one column per joint,
+// i.e. motor ID = 10*leg + joint
+#define CHECKUP_LINE_OFFSET 24 // pixels between rows
+#define CHECKUP_COL_X(joint) ((3 + 5 * (joint)) * 12) // x of the value column for joint 0..2
 
-  this->_tft.setTextColor(ST77XX_BLUE,ST77XX_BLACK); 
-  this->_tft.setCursor(0*io, 1*lo); this->_tft.print("11: ");  this->_tft.setCursor(2*io, 1*lo);  this->_tft.print(" 12: "); this->_tft.setCursor(4*io, 1*lo);  this->_tft.print(" 13: "); 
-  this->_tft.setCursor(0*io, 2*lo); this->_tft.print("21: ");  this->_tft.setCursor(2*io, 2*lo);  this->_tft.print(" 22: "); this->_tft.setCursor(4*io, 2*lo);  this->_tft.print(" 23: "); 
-  this->_tft.setCursor(0*io, 3*lo); this->_tft.print("31: ");  this->_tft.setCursor(2*io, 3*lo);  this->_tft.print(" 32: "); this->_tft.setCursor(4*io, 3*lo);  this->_tft.print(" 33: "); 
-  this->_tft.setCursor(0*io, 4*lo); this->_tft.print("41: ");  this->_tft.setCursor(2*io, 4*lo);  this->_tft.print(" 42: "); this->_tft.setCursor(4*io, 4*lo);  this->_tft.print(" 43: "); 
+void Qutee::tft_init_checkup_screen() {
+  this->_tft.fillScreen(ST77XX_BLACK);
+  this->_tft.setTextSize(2);
+  this->_tft.setTextColor(ST77XX_RED,ST77XX_BLACK);
+  this->_tft.setCursor(0, 0);    this->_tft.print("Err");
+  this->_tft.setTextColor(ST77XX_BLUE,ST77XX_BLACK);
+  for(size_t joint = 0; joint < 3; joint++){
+    this->_tft.setCursor(CHECKUP_COL_X(joint), 0); this->_tft.printf("J%d", joint + 1);
+  }
+  for(size_t leg = 0; leg < 4; leg++){
+    this->_tft.setCursor(0, (leg + 1) * CHECKUP_LINE_OFFSET); this->_tft.printf("L%d", leg + 1);
+  }
 }
 
 void Qutee::tft_update_checkup_screen(const float* err) {
-  int lo = 10; // line offset
-  int io = 32; // item offset
-  char buf[6]; // 5 characters + NUL
-  this->_tft.setTextSize(1);
-  this->_tft.setTextColor(ST77XX_WHITE,ST77XX_BLACK); 
-  this->_tft.setCursor(200 , 0);   this->_tft.setTextColor(ST77XX_WHITE,ST77XX_BLACK); this->_tft.print(buf);
-
-  this->_tft.setTextSize(1);
-  // State
+  char buf[8];
+  this->_tft.setTextSize(2);
   for(size_t i=0; i < 12; i++){
     if(err[i]>0.1)
       this->_tft.setTextColor(ST77XX_RED,ST77XX_BLACK);
     else
       this->_tft.setTextColor(ST77XX_WHITE,ST77XX_BLACK);
-    sprintf(buf, "%- 1.2f",err[i] );
-    this->_tft.setCursor( ((i%3) *2 +1)*io, (i/3 + 1)*lo); this->_tft.print(buf); 
+    snprintf(buf, sizeof(buf), "%4.2f", err[i]);
+    this->_tft.setCursor(CHECKUP_COL_X(i%3), (i/3 + 1) * CHECKUP_LINE_OFFSET); this->_tft.print(buf);
   }
- 
+
 }
 
 
@@ -644,12 +692,48 @@ std::vector<std::string>  Qutee::get_name_list(){
   return names;
 }
 
+// Wait for a press of D0 (Boot) and return true for a long press, false for a short press.
+// Returns as soon as the long press is detected, then waits for the release.
+bool Qutee::wait_button_press(){
+  while(gpio_get_level(GPIO_NUM_0)) delay(10); // D0 is active low
+  int64_t start = esp_timer_get_time();
+  bool long_press = false;
+  while(!gpio_get_level(GPIO_NUM_0)){
+    if(!long_press && esp_timer_get_time() - start > LONG_PRESS_US){
+      long_press = true;
+      this->tft_status("Selected", ST77XX_GREEN);
+    }
+    delay(10);
+  }
+  delay(50); // debounce
+  return long_press;
+}
+
 void Qutee::select_name(){
-  
+
   std::vector<std::string> names = this->get_name_list();
-  char buf[3]; // 1 characters + NUL  
   bool selected = false;
   size_t id = 0;
+#if !QUTEE_THREE_BUTTONS
+  while(!selected){
+    this->_tft.fillScreen(ST77XX_BLACK);
+    this->_tft.setTextSize(2);
+    this->_tft.setCursor(0, 0);
+    this->_tft.setTextColor(ST77XX_GREEN);
+    this->_tft.println("Select Name");
+    this->_tft.setCursor(0, 50);
+    this->_tft.setTextColor(ST77XX_BLUE);
+    this->_tft.print("> ");
+    this->_tft.println(names[id].c_str());
+    this->tft_status("Press: next name   Hold: select");
+    ESP_LOGI("Menu", "Entering name_select menu. Waiting for a button to be pressed");
+    if(this->wait_button_press())
+      selected = true;
+    else
+      id = (id + 1) % names.size();
+  }
+#else
+  char buf[3]; // 1 characters + NUL
   while(!selected)
     {
       while(!gpio_get_level(GPIO_NUM_0) || gpio_get_level(GPIO_NUM_1) ||gpio_get_level(GPIO_NUM_2)){} // we loop as long as one button is pressed
@@ -701,9 +785,12 @@ void Qutee::select_name(){
 	      id = names.size()-1;
 	  }
     }
+#endif
   this->name = names[id];
   this->name_memory(&id,true);
+#if QUTEE_THREE_BUTTONS
   while(!gpio_get_level(GPIO_NUM_0) || gpio_get_level(GPIO_NUM_1) ||gpio_get_level(GPIO_NUM_2)){} // we loop as long as one button is pressed
+#endif
   delay(100);
   return;
 }
@@ -740,9 +827,53 @@ void Qutee::name_memory(size_t * id, bool write = false){
 
 }
 
+// clear the menu before returning to the main function, where we launch ros and co.
+// The backlight stays on (dim) so the status line shows that the robot is running.
+void Qutee::enter_ros_mode(){
+  if(this->_imu_available && !this->_bno.isFullyCalibrated()) {this->calibration();}
+  this->_tft.fillScreen(ST77XX_BLACK);
+  this->_tft.setCursor(0, 30);
+  this->_tft.setTextSize(2);
+  this->_tft.setTextColor(ST77XX_GREEN);
+  this->_tft.println(this->name.c_str());
+  this->_tft.println("ROS mode");
+}
+
 void Qutee::menu(){
-  bool screen_on = false;
   gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
+#if !QUTEE_THREE_BUTTONS
+  const char* items[] = {"Select Name", "Start Checkup", "Start ROS"};
+  const uint16_t colors[] = {ST77XX_GREEN, ST77XX_RED, ST77XX_BLUE};
+  size_t highlighted = 0;
+  while(!gpio_get_level(GPIO_NUM_0)) delay(10); // wait for the button to be released
+  while(1){
+    this->_tft.setTextWrap(false);
+    this->_tft.fillScreen(ST77XX_BLACK);
+    this->_tft.setTextSize(2);
+    for(size_t i = 0; i < 3; i++){
+      this->_tft.setCursor(0, i * 40);
+      this->_tft.setTextColor(colors[i]);
+      this->_tft.print(i == highlighted ? "> " : "  ");
+      this->_tft.println(items[i]);
+    }
+    this->tft_status("Press: next   Hold: select");
+    ESP_LOGI("Menu", "Entering menu. Waiting for a button to be pressed");
+
+    if(!this->wait_button_press()){
+      highlighted = (highlighted + 1) % 3;
+      continue;
+    }
+    if(highlighted == 0)
+      this->select_name();
+    else if(highlighted == 1)
+      this->checkup(); // runs until the button is pressed
+    else {
+      this->enter_ros_mode();
+      return;
+    }
+  }
+#else
+  bool screen_on = false;
   gpio_set_direction(GPIO_NUM_1, GPIO_MODE_INPUT);
   gpio_set_direction(GPIO_NUM_2, GPIO_MODE_INPUT);
 
@@ -779,15 +910,14 @@ void Qutee::menu(){
 	
       }
     if(gpio_get_level(GPIO_NUM_1)){
-      this->checkup(); // start checkup infinite loop
+      this->checkup(); // runs until D0 is pressed
+      screen_on=false; // replot the menu
     }
     if(gpio_get_level(GPIO_NUM_2)){
-      if(!this->_bno.isFullyCalibrated()) {this->calibration();}
-      this->_tft.fillScreen(ST77XX_BLACK); // clear menu before returning to the main function, where we launch ros and co.
-      this->set_tft_brightness(0); // disable backlight.
+      this->enter_ros_mode();
       return;
     }
 
   }
-
+#endif
 }

@@ -20,6 +20,7 @@
 
 
 #include <uros_network_interfaces.h>
+#include "esp_netif.h"
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 //#include <sensor_msgs/msg/imu.h>
@@ -336,7 +337,12 @@ void micro_ros_task(void * arg)
 #endif
 
     // Setup support structure.
-    RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator));
+    robot.tft_status("Connecting to agent " CONFIG_MICRO_ROS_AGENT_IP ":" CONFIG_MICRO_ROS_AGENT_PORT);
+    if(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator) != RCL_RET_OK){
+      ESP_LOGE("UROS","Could not reach the micro-ROS agent at " CONFIG_MICRO_ROS_AGENT_IP ":" CONFIG_MICRO_ROS_AGENT_PORT);
+      robot.tft_status("Agent unreachable: start it, then reset", ST77XX_RED);
+      vTaskDelete(NULL);
+    }
 
     // create node
     RCCHECK(rclc_node_init_default(&node, "qutee_node", robot.get_name().c_str(), &support));
@@ -370,6 +376,7 @@ void micro_ros_task(void * arg)
     ESP_LOGI("UROS","exec");
     RCCHECK(rclc_executor_add_service(&executor, &service_rollout, &req_rollout, &res_rollout, rollout_callback));
     ESP_LOGI("UROS","DONE");
+    robot.tft_status("Connected to agent, ready", ST77XX_GREEN);
     
     /*
     // Create publisher.
@@ -426,7 +433,18 @@ extern "C" void app_main()
 
     // Initialize network interface if needed
     #if defined(CONFIG_MICRO_ROS_ESP_NETIF_WLAN) || defined(CONFIG_MICRO_ROS_ESP_NETIF_ENET)
+    robot.tft_status("Connecting to WiFi " CONFIG_ESP_WIFI_SSID);
     ESP_ERROR_CHECK(uros_network_interface_initialize());
+    // uros_network_interface_initialize() also returns when the connection failed, so check for an IP address
+    esp_netif_ip_info_t ip_info = {};
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if(netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0){
+      char msg[40];
+      snprintf(msg, sizeof(msg), "WiFi connected, IP " IPSTR, IP2STR(&ip_info.ip));
+      robot.tft_status(msg, ST77XX_GREEN);
+    }
+    else
+      robot.tft_status("WiFi failed: check SSID/password", ST77XX_RED);
     #endif
     
     // Create task to handle Micro-ROS operations

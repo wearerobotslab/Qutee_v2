@@ -1,6 +1,8 @@
 ## IDF Component Manager Manifest File
 dependencies:
   espressif/eigen: "^3.4.0~2"
+  # esp_insights 1.0.1 (pulled in by arduino) doesn't compile against esp_diag_data_store 1.0.2
+  espressif/esp_diag_data_store: "1.0.1"
   idf:
     version: ">=5.1.0"
   # # Put list of dependencies here
