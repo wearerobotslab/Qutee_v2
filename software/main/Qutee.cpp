@@ -31,7 +31,7 @@ void Qutee::init(){
   //Wire.begin();
   init_tft();
 
-  size_t name_id;
+  size_t name_id = 0; // first name in the list until one is selected in the menu (the NVS read fails on a new robot)
   this->name_memory(&name_id,false);
   std::vector<std::string> names = get_name_list();
   if(name_id < names.size())
