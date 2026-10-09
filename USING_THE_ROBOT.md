@@ -148,6 +148,8 @@ python ..\tools\serial_monitor.py COM3
 
 `software/tools/serial_monitor.py` reconnects automatically when the board resets (the Feather's USB port disappears for a moment on every reset) and shows the log colours. Quit with **Ctrl+C**, **Ctrl+X** or **q**.
 
+If the board was reset with its **Reset** button and is now quiet (for example in the menu), quitting takes about 30 s: the monitor prints `Closing COM3 ...` and Windows' USB serial driver takes that long to release the port. The port can't be used (for example by esptool) until the monitor has exited.
+
 The first half second of boot output can be lost after a reset while Windows re-detects the port; everything from the application is shown.
 
 If you use pyserial's `miniterm` instead, add `--exit-char 24` so **Ctrl+X** quits: VS Code's terminal captures miniterm's default Ctrl+], and ESP-IDF's colour codes show up as `␛[0;32m`.
@@ -229,6 +231,8 @@ The screen shows "Hi! My name is ... Loading!", then a status line along the bot
 | Powered on | Firmware started. |
 | IMU not found, continuing without it | No BNO055. Orientation and acceleration read as zero. |
 | No battery monitor, continuing | Battery voltage reads as 0. |
+| Switch on the motor battery | The motors answer but report less than 4.6 V: they are powered only through USB. Switch on the battery; the robot then continues by itself. |
+| Motor N error 0xNN | Motor N still reports a hardware error after the firmware rebooted it (see [Troubleshooting](#troubleshooting)). |
 | Setting up motors... | Configuring the 12 motors. Takes about 10 s when they don't answer. |
 | Motors found: N/12 | Green if all 12 answer, yellow otherwise. |
 
@@ -285,6 +289,7 @@ When all 12 are set, the boot screen should show "Motors found: 12/12".
 | Screen stays black | Firmware built for the wrong board. Check `CONFIG_ARDUINO_VARIANT` in `sdkconfig` (see the next section). |
 | Serial monitor shows nothing | The robot is waiting in the menu, which only logs once. Press **Reset** with the monitor running. |
 | `task_wdt: Task watchdog got triggered` during "Setting up motors" | The motors aren't answering; the library keeps the CPU busy while it waits. Harmless, but see [Setting up the motors](#setting-up-the-motors). |
+| A motor's LED blinks red | The motor has a hardware error and has turned its torque off. The most common cause is powering the robot through USB with the battery off: the Feather's charger then feeds the motors through VBAT at too low a voltage. At boot the firmware waits for the battery and reboots motors with an error, logging each motor's voltage and error bits (`input-voltage`, `overheating`, `encoder`, `electrical-shock`, `overload`). If it comes back, read **Hardware Error Status** (address 70) in Dynamixel Wizard. |
 | `Wire.cpp ... requestFrom(): ... Error -1` at boot | Printed while the battery monitor resets. Harmless. |
 | `Detected size(4096k) larger than the size in the binary image header(2048k)` | Harmless: the firmware uses 2 MB of the board's 4 MB flash. |
 | Robot can't reach the agent from Windows | Check mirrored networking (`hostname -I` in WSL shows the Windows IP), the firewall rule, that the WiFi network is Private, and the Agent IP in menuconfig. |

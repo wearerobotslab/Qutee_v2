@@ -98,6 +98,7 @@ void Qutee::init(){
     delay(1000);
   }
 
+  check_motor_power();
   this->tft_status("Setting up motors...");
   init_motors();
   scan();
@@ -415,6 +416,91 @@ void Qutee::scan()
   delay(1000);
 }
 
+// With USB plugged in and the motor battery off, the Feather's charger feeds the motor bus through VBAT.
+// The motors then start underpowered and latch an input voltage error, which only a reboot clears.
+// So wait until the motors report a real supply voltage, then reboot any motor with a latched error.
+void Qutee::check_motor_power()
+{
+  const float min_voltage = 4.6f; // the NiMH pack is about 5.2-5.5 V; USB back-feed gives less
+  bool waiting_shown = false;
+  int answered = 0;
+  while(true){
+    answered = 0;
+    int lowest_id = -1;
+    float lowest_voltage = 100.0f;
+    for(int i = 0; i < DXL_ID_CNT; i++){
+      int32_t raw = this->_dxl.readControlTableItem(PRESENT_INPUT_VOLTAGE, DXL_IDs[i]);
+      if(this->_dxl.getLastLibErrCode() != DXL_LIB_OK)
+        continue;
+      answered++;
+      if(raw / 10.0f < lowest_voltage){
+        lowest_voltage = raw / 10.0f;
+        lowest_id = DXL_IDs[i];
+      }
+    }
+    // No motor answering is reported later by scan(), as before
+    if(answered == 0 || lowest_voltage >= min_voltage)
+      break;
+    if(!waiting_shown){
+      ESP_LOGW("DXL: ","Motor %d reads %.1f V: waiting for the motor battery", lowest_id, lowest_voltage);
+      this->tft_status("Switch on the motor battery", ST77XX_YELLOW);
+      waiting_shown = true;
+    }
+    delay(500);
+  }
+  if(answered == 0)
+    return;
+  if(waiting_shown)
+    delay(500); // let the supply settle after the battery is switched on
+
+  this->reboot_faulted_motors(true);
+}
+
+// Reboot the motors with a latched hardware error (a fault turns the motor's torque off until it
+// is rebooted), and add each fault to _motor_report. Returns the number of motors rebooted.
+// The caller must set up the rebooted motors again (init_motors), since a reboot resets them.
+int Qutee::reboot_faulted_motors(bool log_healthy)
+{
+  int rebooted = 0;
+  for(int i = 0; i < DXL_ID_CNT; i++){
+    int id = DXL_IDs[i];
+    int32_t error = this->_dxl.readControlTableItem(HARDWARE_ERROR_STATUS, id);
+    if(this->_dxl.getLastLibErrCode() != DXL_LIB_OK)
+      continue;
+    float voltage = this->_dxl.readControlTableItem(PRESENT_INPUT_VOLTAGE, id) / 10.0f;
+    if(error == 0){
+      if(log_healthy)
+        ESP_LOGI("DXL: ","Motor %d: %.1f V, no error", id, voltage);
+      continue;
+    }
+    // Bits: 0 input voltage, 2 overheating, 3 motor encoder, 4 electrical shock, 5 overload
+    std::string names = std::string((error & 0x01) ? " input-voltage" : "") + ((error & 0x04) ? " overheating" : "")
+                      + ((error & 0x08) ? " encoder" : "") + ((error & 0x10) ? " electrical-shock" : "")
+                      + ((error & 0x20) ? " overload" : "");
+    ESP_LOGW("DXL: ","Motor %d: %.1f V, hardware error 0x%02lx%s, rebooting it", id, voltage, (long) error, names.c_str());
+    this->_motor_report += "motor " + std::to_string(id) + names + " (rebooted); ";
+    this->_dxl.reboot(id);
+    rebooted++;
+  }
+  if(rebooted == 0)
+    return 0;
+  delay(1000); // the motors take a moment to restart
+
+  for(int i = 0; i < DXL_ID_CNT; i++){
+    int id = DXL_IDs[i];
+    int32_t error = this->_dxl.readControlTableItem(HARDWARE_ERROR_STATUS, id);
+    if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && error != 0){
+      ESP_LOGE("DXL: ","Motor %d still has hardware error 0x%02lx after a reboot", id, (long) error);
+      this->_motor_report += "motor " + std::to_string(id) + " still faulty after reboot; ";
+      char msg[40];
+      snprintf(msg, sizeof(msg), "Motor %d error 0x%02lx", id, (long) error);
+      this->tft_status(msg, ST77XX_RED);
+      delay(2000);
+    }
+  }
+  return rebooted;
+}
+
 void Qutee::init_motors()
 {
           // Turn off torque when configuring items in EEPROM area
@@ -509,18 +595,16 @@ void Qutee::get_motor_positions(State_t& state_ref, size_t offset)
 {
   // Transmit predefined SyncRead instruction packet
   // and receive a status packet from each DYNAMIXEL
+  // SyncRead stops at the first motor that doesn't answer, so only the first recv_cnt motors
+  // are fresh. The others keep their last known position.
   uint8_t i, recv_cnt;
   recv_cnt = this->_dxl.syncRead(&this->_sr_infos);
-  if(recv_cnt > 0) {
-    //ESP_LOGI("Control Loop","[SyncRead] Success, Received ID Count: %i ",recv_cnt);
-    for(i = 0; i<recv_cnt; i++){
-      state_ref(i+offset,0)= (this->_sr_data[i].present_position-2048.0f)/512.0f;
-      //ESP_LOGI("Control Loop","  ID: %i, \t Present Position: %i",this->_sr_infos.p_xels[i].id), this->_sr_data[i].present_position);
-    }
-  }else{
-    //ESP_LOGE("Control Loop"," [SyncRead] Fail, Lib error code: %i ",this->_dxl.getLastLibErrCode()); // TODO fix this error
-  }
-
+  for(i = 0; i<recv_cnt; i++)
+    this->_last_positions[i] = (this->_sr_data[i].present_position-2048.0f)/512.0f;
+  if(recv_cnt < DXL_ID_CNT)
+    this->_incomplete_reads++;
+  for(i = 0; i<DXL_ID_CNT; i++)
+    state_ref(i+offset,0) = this->_last_positions[i];
 }
 
 void Qutee::control_step(State_t& state_to_fill, Actions_t& actions_to_fill){
@@ -536,7 +620,12 @@ void Qutee::control_step(State_t& state_to_fill, Actions_t& actions_to_fill){
  }
 
 void Qutee::run_episode(){
-  //
+  // A motor that tripped (e.g. overload) in an earlier episode stays limp until it is rebooted
+  this->_motor_report.clear();
+  if(this->reboot_faulted_motors(false) > 0)
+    this->init_motors(); // a reboot turns torque off and resets the gains
+  this->_incomplete_reads = 0;
+
   this->go_to_neutral_pose();
   std::this_thread::sleep_for(std::chrono::microseconds(1000000));
   int64_t start, sleep_duration;
@@ -561,6 +650,11 @@ void Qutee::run_episode(){
   }
   this->go_to_neutral_pose();
   ESP_LOGI("Control Loop", "duration of the loop: %" PRId64, esp_timer_get_time() - start_loop);
+  if(this->_incomplete_reads > 0){
+    ESP_LOGW("Control Loop", "%d of %d motor reads were incomplete; missing positions kept their last value",
+             this->_incomplete_reads, (int) NB_STEPS);
+    this->_motor_report += std::to_string(this->_incomplete_reads) + " incomplete motor reads; ";
+  }
  }
 
 

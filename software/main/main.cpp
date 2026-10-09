@@ -21,6 +21,7 @@
 
 #include <uros_network_interfaces.h>
 #include "esp_netif.h"
+#include "esp_mac.h"
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 //#include <sensor_msgs/msg/imu.h>
@@ -307,10 +308,11 @@ void status_callback(const void * req, void * res){
   res_in->number_weights = robot.get_policy().get_number_weights();
   printf("Service done\n");
 
-  // we can probably move such static init to the message init instead. 
-  res_in->error_message.data = &res_message;
-  res_in->error_message.size = 1;
-  res_in->error_message.capacity = 1; 
+  // Motor problems found during the last rollout (empty if none)
+  const std::string& report = robot.get_motor_report();
+  res_in->error_message.data = report.empty() ? &res_message : const_cast<char*>(report.c_str());
+  res_in->error_message.size = report.size();
+  res_in->error_message.capacity = report.size() + 1;
   
 }
 
@@ -334,6 +336,13 @@ void micro_ros_task(void * arg)
     // Static Agent IP and port can be used instead of autodisvery.
     RCCHECK(rmw_uros_options_set_udp_address(CONFIG_MICRO_ROS_AGENT_IP, CONFIG_MICRO_ROS_AGENT_PORT, rmw_options));
     //RCCHECK(rmw_uros_discover_agent(rmw_options));
+
+    // Use a client key that stays the same across resets (from the MAC address). The agent then
+    // replaces the robot's previous session instead of keeping its stale services alongside the new ones.
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    uint32_t client_key = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
+    RCCHECK(rmw_uros_options_set_client_key(client_key, rmw_options));
 #endif
 
     // Setup support structure.
@@ -405,8 +414,19 @@ void micro_ros_task(void * arg)
     */
     
     // Spin forever
+    // Ping the agent regularly: without traffic from the robot, NAT between the robot and the
+    // agent (e.g. Docker port forwarding) drops the UDP flow and service requests never arrive.
+    const int64_t keepalive_period_us = 5000000;
+    int64_t last_keepalive = esp_timer_get_time();
     while(1){
-      RCCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10000)));
+      // Soft check: a reply that fails to send (e.g. too large) must not stop the ROS task
+      RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1000)));
+      if(esp_timer_get_time() - last_keepalive > keepalive_period_us){
+        if(rmw_uros_ping_agent(100, 1) != RMW_RET_OK){
+          ESP_LOGW("UROS","No answer from the agent to the keepalive ping");
+        }
+        last_keepalive = esp_timer_get_time();
+      }
       usleep(100000);
     }
 

@@ -25,8 +25,23 @@ baud = int(sys.argv[2]) if len(sys.argv) > 2 else 115200
 os.system("")  # enables ANSI colour codes in the Windows console
 out = sys.stdout.buffer
 
-# Ctrl+C sets a flag instead of raising KeyboardInterrupt, which pyserial on Windows
-# can turn into a SerialException that looks like a disconnect.
+# On Windows, Ctrl+C is not always delivered as a signal (it depends on the terminal and how
+# the process was started). Turn off the console's Ctrl+C processing so it arrives as a normal
+# key press, which quit_requested() reads like Ctrl+X and q. The mode is restored on exit.
+console_in = None
+console_mode = None
+if msvcrt is not None:
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    console_in = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+    mode = ctypes.c_uint32()
+    if kernel32.GetConsoleMode(console_in, ctypes.byref(mode)):
+        console_mode = mode.value
+        kernel32.SetConsoleMode(console_in, console_mode & ~0x0001)  # clear ENABLE_PROCESSED_INPUT
+
+# Where Ctrl+C is still a signal, it sets a flag instead of raising KeyboardInterrupt, which
+# pyserial on Windows can turn into a SerialException that looks like a disconnect.
 stop = False
 
 
@@ -56,6 +71,9 @@ while not quit_requested():
                 if data:
                     out.write(data)
                     out.flush()
+            # After the board has been reset with its Reset button and gone quiet, Windows'
+            # USB serial driver takes about 30 s to close the port. Nothing on our side avoids it.
+            print(f"\n--- Closing {port} (Windows can take up to 30 s after a board reset) ---", flush=True)
     except (serial.SerialException, OSError):
         if quit_requested():
             break
@@ -67,4 +85,6 @@ while not quit_requested():
                 break
             except (serial.SerialException, OSError):
                 pass
+if console_mode is not None:
+    kernel32.SetConsoleMode(console_in, console_mode)
 print("\n--- Exiting ---")

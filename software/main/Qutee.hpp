@@ -75,10 +75,14 @@ public:
   void checkup();
   void menu();
   void tft_status(const char* msg, uint16_t color = ST77XX_WHITE);
+  // Motor problems found during the last episode (empty if none), reported by the status service
+  const std::string& get_motor_report(){return _motor_report;}
 private:
   void send_actions(const Actions_t& actions);
   void get_motor_positions(State_t& state_ref, size_t offset);
   void get_state(State_t& state_ref);
+  void check_motor_power();
+  int reboot_faulted_motors(bool log_healthy);
   void init_motors();
   void set_PID_gains();
   void init_imu();
@@ -140,6 +144,11 @@ private:
   DYNAMIXEL::XELInfoSyncWrite_t _info_xels_sw[DXL_ID_CNT];
   static const uint16_t _user_pkt_buf_cap = 128;
   uint8_t _user_pkt_buf[_user_pkt_buf_cap];
+  // Last position read from each motor (scaled like the state, 0 = neutral). Used when a
+  // SyncRead stops early, so the state never contains uninitialised values.
+  float _last_positions[DXL_ID_CNT] = {};
+  int _incomplete_reads = 0; // SyncReads in the current episode that didn't get all motors
+  std::string _motor_report;
   std::string name;
 };
 
