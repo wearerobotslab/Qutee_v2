@@ -54,8 +54,13 @@ Settings are changed with `idf.py menuconfig` inside the container (see the Wind
 | **micro-ROS Settings → WiFi Configuration** | WiFi SSID / Password | Your network. The ESP32-S3 only supports 2.4 GHz. |
 | **micro-ROS Settings** | micro-ROS Agent IP / Port | IP of the computer running the micro-ROS agent, port `8888`. |
 | **QUTEE settings** | Name of the Qutee robot | One name, or several separated by `;` (you pick one on the robot). Used as the ROS namespace, so use only letters, digits and `_`. |
+| **QUTEE settings** | Leg angle that puts the torso on the ground | Default 60°. See [Poses](#poses). |
+| **QUTEE settings** | Leg angle of the rest pose | Default 35°: the torso rests on the ground. See [Poses](#poses). |
+| **QUTEE settings** | Turn the motors' torque off in the rest pose | Default on. Turn it off if the robot hangs on a stand, so the legs stay up. |
+| **QUTEE settings** | Duration of a slow move between poses | Default 1000 ms. |
+| **QUTEE settings** | UDP port for the logs over WiFi | Default 8889; 0 turns it off. See [Watch the logs over WiFi](#watch-the-logs-over-wifi). |
 
-Press **S** to save and **Q** to quit, then rebuild.
+Press **S** to save and **Q** to quit, then rebuild. After adding a new setting to `main/Kconfig.projbuild`, run `idf.py reconfigure` before building so that it appears in `sdkconfig`.
 
 The settings are saved in `software/sdkconfig`, which git ignores, so your WiFi password is not committed. Do not put your own WiFi details in `sdkconfig.defaults`, which is committed.
 
@@ -82,8 +87,9 @@ Tested on Windows 11 with WSL2 (Ubuntu) and Docker Desktop. The repo lives insid
 4. **Firewall.** In PowerShell **as Administrator**:
    ```powershell
    New-NetFirewallRule -DisplayName "micro-ROS agent UDP 8888" -Direction Inbound -Protocol UDP -LocalPort 8888 -Action Allow
+   New-NetFirewallRule -DisplayName "Qutee logs UDP 8889" -Direction Inbound -Protocol UDP -LocalPort 8889 -Action Allow
    ```
-   Also make sure your WiFi network is set to **Private** in Windows.
+   The second rule is for [the logs over WiFi](#watch-the-logs-over-wifi). Also make sure your WiFi network is set to **Private** in Windows.
 
 ### Build the Docker image (once, or after changing the Dockerfile)
 
@@ -153,6 +159,16 @@ If the board was reset with its **Reset** button and is now quiet (for example i
 The first half second of boot output can be lost after a reset while Windows re-detects the port; everything from the application is shown.
 
 If you use pyserial's `miniterm` instead, add `--exit-char 24` so **Ctrl+X** quits: VS Code's terminal captures miniterm's default Ctrl+], and ESP-IDF's colour codes show up as `␛[0;32m`.
+
+### Watch the logs over WiFi
+
+To run the robot without the USB cable, read its logs over WiFi instead:
+
+```powershell
+python ..\tools\wifi_monitor.py
+```
+
+Run it on the computer whose IP is the micro-ROS Agent IP (it needs the firewall rule for UDP 8889, see [One-time setup](#one-time-setup)). The robot only joins WiFi in ROS mode: when you choose **Start ROS**, the monitor shows `Receiving from <robot IP>`, then the logs since the robot was switched on (it keeps the last 16 KB until WiFi connects), then the live logs. It needs only Python's standard library and quits at once with **Ctrl+C**, **Ctrl+X** or **q**. Lines containing "password" are never sent over the network.
 
 ### Run the micro-ROS agent
 
@@ -240,7 +256,19 @@ The screen shows "Hi! My name is ... Loading!", then a status line along the bot
 | Setting up motors... | Configuring the 12 motors. Takes about 10 s when they don't answer. |
 | Motors found: N/12 | Green if all 12 answer, yellow otherwise. |
 
-The same information, in more detail, is in the serial log.
+The same information, in more detail, is in the serial log. The robot then settles into its [rest pose](#poses): it raises its legs so the torso comes down onto the ground, lowers them to the rest pose, and turns the motors' torque off.
+
+### Poses
+
+The robot never jumps between poses: every change is a smooth move of about 1 s (menuconfig: QUTEE settings). Only joint 2 of each leg (motors 12, 22, 32, 42) changes; on all four legs a negative angle raises the leg.
+
+| Pose | Joint 2 | Used |
+|---|---|---|
+| Legs up | -60° | Torso on the ground, legs off it, so every joint can realign without load. |
+| Rest | -35° | After boot, after a rollout and after the checkup. The torso rests on the ground; with "Turn the motors' torque off in the rest pose" the motors then go limp to save the battery. |
+| Standing | 0° | Start of each rollout and of the checkup. Reached from the rest pose through "legs up", because limp legs drift (hips splayed, knees folded) and can't lift the body from there. |
+
+**Tune the rest angle on the floor.** With the torque turned off at rest, the torso must already rest on the ground: if the legs still carry the robot when they go limp, the torso drops and the falling legs can trip the motors (red LEDs). If the legs are lifted clearly into the air at rest, lower the angle a little so they don't fall when released.
 
 ### The menu (Boot button)
 
@@ -251,7 +279,7 @@ The same information, in more detail, is in the serial log.
 
 Options:
 - **Select Name**: pick the robot's name from the list set in menuconfig (short press: next name, long press: choose). The choice is remembered across reboots. Until a name is chosen, the robot uses the first name in the list.
-- **Start Checkup**: moves all motors in a slow sine wave and shows each motor's average position error, one row per leg and one column per joint. Values above 0.1 are red. Hold **Boot** until the menu comes back to stop it.
+- **Start Checkup**: stands up, then moves all motors in a slow sine wave and shows each motor's average position error, one row per leg and one column per joint. Values above 0.1 are red. Hold **Boot** until the menu comes back to stop it; the robot then goes back to rest.
 - **Start ROS**: connects to WiFi and the micro-ROS agent. You can't go back to the menu from ROS mode; press **Reset**.
 
 ### ROS mode
@@ -314,7 +342,7 @@ print("states", states.shape, "actions", actions.shape)
 EOF
 ```
 
-The reply comes after about 6.5 s: 1 s to go to the neutral pose, then the episode.
+The reply comes after about 10 s: the robot stands up from rest (legs up, then standing, about 2 s), waits 1 s, runs the 5 s episode and goes back to rest (about 1 s).
 
 ### Rollout data
 
@@ -325,7 +353,7 @@ The reply comes after about 6.5 s: 1 s to go to the neutral pose, then the episo
 
 ### Motor faults during rollouts
 
-Large weights (for example ±1) make the joints swing between ±45° at full speed, and a motor that can't keep up can trip on **overload** (its LED blinks red and its torque turns off). Before each rollout the firmware reboots any motor in that state and sets it up again, and `status` then reports it in `error_message`, for example `motor 43 overload (rebooted);`. `error_message` also reports `N incomplete motor reads;` when some position reads failed during the episode (the state then keeps the last known position for those motors). Check `error_message` after each rollout and treat a non-empty one as a sign that the episode's data may be unreliable.
+Large weights (for example ±1) make the joints swing between ±45° at full speed, and a motor that can't keep up can trip on **overload** (its LED blinks red and its torque turns off). Before each rollout the firmware reboots any motor in that state and sets it up again, and `status` then reports it in `error_message`, for example `motor 43 overload (rebooted);`. `error_message` also reports `N incomplete motor reads;` when some position reads failed during the episode even after a retry (the state then keeps the last known position for those motors; replies get lost more often while the legs carry the robot), and `motor N torque did not turn on;` when a motor didn't accept the command after 3 attempts. Check `error_message` after each rollout and treat a non-empty one as a sign that the episode's data may be unreliable.
 
 ## Setting up the motors
 
@@ -348,6 +376,8 @@ When all 12 are set, the boot screen should show "Motors found: 12/12".
 | Serial monitor shows nothing | The robot is waiting in the menu, which only logs once. Press **Reset** with the monitor running. |
 | `task_wdt: Task watchdog got triggered` during "Setting up motors" | The motors aren't answering; the library keeps the CPU busy while it waits. Harmless, but see [Setting up the motors](#setting-up-the-motors). |
 | A motor's LED blinks red | The motor has a hardware error and has turned its torque off. The most common cause is powering the robot through USB with the battery off: the Feather's charger then feeds the motors through VBAT at too low a voltage. At boot the firmware waits for the battery and reboots motors with an error, logging each motor's voltage and error bits (`input-voltage`, `overheating`, `encoder`, `electrical-shock`, `overload`). If it comes back, read **Hardware Error Status** (address 70) in Dynamixel Wizard. |
+| Motors turn red when the robot goes to rest | The legs were still carrying the robot when the torque turned off. Increase "Leg angle of the rest pose" until the torso rests on the ground first (see [Poses](#poses)). |
+| The robot doesn't stand up at the start of a rollout | Check the battery (`status`): below about 4.9 V the motors may not lift the body. The serial or WiFi log shows where joint 2 of each leg ended up after each move (`Pose: joint 2 target ... reached ...`). |
 | `Wire.cpp ... requestFrom(): ... Error -1` at boot | Printed while the battery monitor resets. Harmless. |
 | `Detected size(4096k) larger than the size in the binary image header(2048k)` | Harmless: the firmware uses 2 MB of the board's 4 MB flash. |
 | Robot can't reach the agent from Windows | Check mirrored networking (`hostname -I` in WSL shows the Windows IP), the firewall rule, that the WiFi network is Private, the Agent IP in menuconfig, and that the agent runs with `-p 8888:8888/udp` (not `--net=host`). |

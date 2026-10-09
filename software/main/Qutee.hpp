@@ -69,7 +69,8 @@ public:
   const List_Actions_t& get_list_actions(){return _actions;}
   const List_State_t& get_list_states(){return _states;}
   void calibration();
-  void go_to_neutral_pose();
+  void go_to_rest_pose();
+  void go_to_standing_pose();
   float battery_voltage();
   std::string get_name(){return this->name;}
   void checkup();
@@ -79,6 +80,9 @@ public:
   const std::string& get_motor_report(){return _motor_report;}
 private:
   void send_actions(const Actions_t& actions);
+  void move_slowly(const Actions_t& target, int duration_ms);
+  void set_torque(bool on);
+  Actions_t legs_raised_pose(float angle_deg);
   void get_motor_positions(State_t& state_ref, size_t offset);
   void get_state(State_t& state_ref);
   void check_motor_power();
@@ -148,6 +152,7 @@ private:
   // SyncRead stops early, so the state never contains uninitialised values.
   float _last_positions[DXL_ID_CNT] = {};
   int _incomplete_reads = 0; // SyncReads in the current episode that didn't get all motors
+  bool _torque_on = false;
   std::string _motor_report;
   std::string name;
 };

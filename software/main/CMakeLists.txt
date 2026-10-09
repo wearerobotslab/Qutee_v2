@@ -76,6 +76,7 @@ execute_process(
 idf_component_register(SRCS "main.cpp"
                             "Qutee.cpp"       
                             "QuteeDxlPortHandler.cpp"
+                            "udp_log.cpp"
                             "../components/Dynamixel2Arduino/src/Dynamixel2Arduino.cpp" 
                             "../components/Dynamixel2Arduino/src/actuator.cpp" 
                             "../components/Dynamixel2Arduino/src/utility/master.cpp" 

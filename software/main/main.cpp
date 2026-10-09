@@ -22,6 +22,7 @@
 #include <uros_network_interfaces.h>
 #include "esp_netif.h"
 #include "esp_mac.h"
+#include "udp_log.hpp"
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 //#include <sensor_msgs/msg/imu.h>
@@ -42,8 +43,8 @@
 #endif
 
 // Define macros for checking return codes from RCL functions
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Aborting.\n",__LINE__,(int)temp_rc);vTaskDelete(NULL);}}
-#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Continuing.\n",__LINE__,(int)temp_rc);}}
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ESP_LOGE("UROS","Failed status on line %d: %d. Aborting.",__LINE__,(int)temp_rc);vTaskDelete(NULL);}}
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ESP_LOGW("UROS","Failed status on line %d: %d. Continuing.",__LINE__,(int)temp_rc);}}
 
 
 
@@ -301,12 +302,12 @@ void status_callback(const void * req, void * res){
   //qutee_interface__srv___Request * req_in = (qutee_interface__srv__Status_Request *) req;
   qutee_interface__srv__Status_Response * res_in = (qutee_interface__srv__Status_Response *) res;
 
-  printf("Service Status request received\n");
+  ESP_LOGI("ROS: ","Service Status request received");
   
   res_in->battery = robot.battery_voltage();
-  printf("Service getting nb weights\n");
+  ESP_LOGI("ROS: ","Service getting nb weights");
   res_in->number_weights = robot.get_policy().get_number_weights();
-  printf("Service done\n");
+  ESP_LOGI("ROS: ","Service done");
 
   // Motor problems found during the last rollout (empty if none)
   const std::string& report = robot.get_motor_report();
@@ -445,7 +446,9 @@ void micro_ros_task(void * arg)
 
 // Entry point of the application
 extern "C" void app_main()
-{ 
+{
+    udp_log_init(); // keep the logs from now on, to send them over WiFi in ROS mode
+
     // Initialize robot and perform calibration
     robot.init();
     robot.menu();
@@ -462,6 +465,7 @@ extern "C" void app_main()
       char msg[40];
       snprintf(msg, sizeof(msg), "WiFi connected, IP " IPSTR, IP2STR(&ip_info.ip));
       robot.tft_status(msg, ST77XX_GREEN);
+      udp_log_start();
     }
     else
       robot.tft_status("WiFi failed: check SSID/password", ST77XX_RED);

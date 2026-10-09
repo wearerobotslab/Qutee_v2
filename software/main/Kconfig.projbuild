@@ -53,6 +53,51 @@ menu "QUTEE settings"
         default 5
         help
         Duration of an episode
-    
+
+    config LEG_UP_ANGLE
+        int "Leg angle that puts the torso on the ground (degrees)"
+        default 60
+        range 0 90
+        help
+        At boot, the legs are first raised by this angle (joint 2 of each leg) so that the torso
+        rests on the ground, then lowered to the rest pose. 0 is the standing pose.
+
+    config LEG_REST_ANGLE
+        int "Leg angle of the rest pose (degrees)"
+        default 35
+        range 0 90
+        help
+        Rest pose, used after boot and between rollouts: the legs are raised by this angle (joint 2
+        of each leg). 0 is the standing pose. With "Turn the motors' torque off in the rest pose",
+        use an angle at which the torso already rests on the ground: if the legs still carry the
+        robot when they go limp, the torso drops and the joints are back-driven fast, which can
+        trip the motors.
+
+    config QUTEE_LOG_UDP_PORT
+        int "UDP port for the logs over WiFi (0 = off)"
+        default 8889
+        range 0 65535
+        help
+        In ROS mode, once WiFi is connected, the robot also sends its logs (starting with the
+        ones since boot) to the micro-ROS agent's IP on this UDP port. Read them with
+        software/tools/wifi_monitor.py. Lines containing "password" are never sent.
+
+    config TORQUE_OFF_AT_REST
+        bool "Turn the motors' torque off in the rest pose"
+        default y
+        help
+        Saves battery and keeps the motors cool between rollouts: once the robot reaches the rest
+        pose, the motors go limp and the torso settles on the ground. The torque comes back on
+        before the next move. Turn this off to keep the legs held in place (for example when the
+        robot hangs on a stand).
+
+    config POSE_TRANSITION_TIME_MS
+        int "Duration of a slow move between poses (ms)"
+        default 1000
+        range 100 10000
+        help
+        Time taken to move between the rest pose, the standing pose and the pose at the end of
+        a rollout.
+
     
 endmenu

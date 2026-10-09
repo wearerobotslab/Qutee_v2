@@ -50,7 +50,7 @@ void Qutee::init(){
   int8_t  protocol = 2;       
   _dxl.setPortProtocolVersion((float) protocol);
   ESP_LOGI("DXL: ","PROTOCOL %i", protocol);
-  ESP_LOGI("DXL: ","BAUDRATE %ld\n", baud);
+  ESP_LOGI("DXL: ","BAUDRATE %ld", baud);
   _dxl.begin(baud);
   
   // Fill the members of structure to syncRead using external user packet buffer
@@ -89,7 +89,7 @@ void Qutee::init(){
   // init battery monitor
   if (this->_maxlipo.begin()) {
     this->_battery_monitor_available = true;
-    ESP_LOGI("BATTERY: ","Found MAX17048 with Chip ID: %d \n",  this->_maxlipo.getChipID());
+    ESP_LOGI("BATTERY: ","Found MAX17048 with Chip ID: %d",  this->_maxlipo.getChipID());
     this->_maxlipo.reset();
   }
   else {
@@ -103,7 +103,9 @@ void Qutee::init(){
   init_motors();
   scan();
   tft_init_data_screen();
-  go_to_neutral_pose();
+  // Settle slowly: raise the legs so the torso rests on the ground, then lower them to the rest pose
+  move_slowly(legs_raised_pose(CONFIG_LEG_UP_ANGLE), CONFIG_POSE_TRANSITION_TIME_MS);
+  go_to_rest_pose();
 }
 
 void Qutee::init_imu(){
@@ -285,9 +287,9 @@ void Qutee::manage_imu_calibration_nvs(uint8_t* calibration_data, size_t size, b
   err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
   
   if (err != ESP_OK) {
-    ESP_LOGE("NVS STORAGE: ","Error (%s) opening NVS handle!\n", esp_err_to_name(err));
+    ESP_LOGE("NVS STORAGE: ","Error (%s) opening NVS handle!", esp_err_to_name(err));
   } else {
-      ESP_LOGI("NVS STORAGE: ","Done\n");
+      ESP_LOGI("NVS STORAGE: ","Done");
       size_t  required_size = size * sizeof(uint8_t);
       ESP_LOGI("NVS STORAGE: ","handling %d bits.", required_size);
       if(write){// WRITE
@@ -349,7 +351,7 @@ void Qutee::calibration()
     else
       count=0;
     this->_bno.getCalibration(&system, &gyro, &accel, &mag);
-    ESP_LOGI("CALIBRATION: ","system %i, gyro %i, accel %i, mag %i, accel_amp %f\n",  system , gyro ,accel, mag, accel_amp);
+    ESP_LOGI("CALIBRATION: ","system %i, gyro %i, accel %i, mag %i, accel_amp %f",  system , gyro ,accel, mag, accel_amp);
     this->_tft.setCursor(0, 20);
     this->_tft.print("system: "); this->_tft.println(system);
     this->_tft.print("gyro: "); this->_tft.println(gyro);
@@ -405,11 +407,11 @@ void Qutee::scan()
   for(int id = 0; id < DXL_BROADCAST_ID; id++) {
       //iterate until all ID in each buadrate is scanned.
       if(this->_dxl.ping(id)) {
-      ESP_LOGI("DXL: ","ID : %i  , Model Number: %i \n",id,this->_dxl.getModelNumber(id));
+      ESP_LOGI("DXL: ","ID : %i  , Model Number: %i",id,this->_dxl.getModelNumber(id));
       found_dynamixel++;
       }
   }   
-  ESP_LOGI("DXL: ","Total %i DYNAMIXEL(s) found!\n",found_dynamixel );
+  ESP_LOGI("DXL: ","Total %i DYNAMIXEL(s) found!",found_dynamixel );
   char msg[32];
   snprintf(msg, sizeof(msg), "Motors found: %i/%i", found_dynamixel, DXL_ID_CNT);
   this->tft_status(msg, found_dynamixel == DXL_ID_CNT ? ST77XX_GREEN : ST77XX_YELLOW);
@@ -509,11 +511,12 @@ void Qutee::init_motors()
     this->_dxl.torqueOff(this->DXL_IDs[i]);
     this->_dxl.setOperatingMode(this->DXL_IDs[i], OP_POSITION);
     this->_dxl.torqueOn(this->DXL_IDs[i]);
-    ESP_LOGI("DXL: ","TORQUE ON \n" );
+    ESP_LOGI("DXL: ","TORQUE ON" );
     // Limit the maximum velocity in Position Control Mode. Use 0 for Max speed
     this->_dxl.writeControlTableItem(PROFILE_VELOCITY, DXL_IDs[i], 0);
     this->set_PID_gains();
   }
+  this->_torque_on = true;
 }
 
 void Qutee::set_PID_gains()
@@ -532,12 +535,93 @@ void Qutee::set_PID_gains()
   return;
 }
 
-void Qutee::go_to_neutral_pose()
+// Pose with joint 2 of every leg raised by angle_deg (positive joint 2 moves a leg down) and the
+// other joints at neutral. 0 is the standing pose; on the ground, raising the legs lowers the torso.
+Qutee::Actions_t Qutee::legs_raised_pose(float angle_deg)
 {
-  Actions_t actions;
-  actions = actions *0.0f;
-  send_actions(actions);
+  Actions_t pose;
+  pose.setZero();
+  for(size_t leg = 0; leg < 4; leg++)
+    pose(leg * 3 + 1, 0) = -angle_deg / 45.0f; // actions: 1 = 45 deg
+  return pose;
+}
 
+// Move from the current joint positions to target, easing in and out, instead of jumping there
+void Qutee::move_slowly(const Actions_t& target, int duration_ms)
+{
+  if(!this->_torque_on)
+    this->set_torque(true);
+  State_t state;
+  this->get_motor_positions(state, 6);
+  Actions_t start;
+  for(size_t i = 0; i < DXL_ID_CNT; i++)
+    start(i, 0) = state(6 + i, 0);
+  int steps = std::max(1, duration_ms * CONFIG_CONTROL_FREQUENCY / 1000);
+  for(int s = 1; s <= steps; s++){
+    float progress = 0.5f - 0.5f * cosf(M_PI * s / steps); // 0 to 1, slow at both ends
+    Actions_t command = start + (target - start) * progress;
+    this->send_actions(command);
+    delay(1000 / CONFIG_CONTROL_FREQUENCY);
+  }
+  // Report where joint 2 of each leg ended up: it falls short of the target when the legs are loaded
+  delay(200);
+  this->get_motor_positions(state, 6);
+  ESP_LOGI("Pose", "joint 2 target %.0f deg, reached: leg1 %.0f, leg2 %.0f, leg3 %.0f, leg4 %.0f",
+           target(1, 0) * 45.0f, state(6 + 1, 0) * 45.0f, state(6 + 4, 0) * 45.0f,
+           state(6 + 7, 0) * 45.0f, state(6 + 10, 0) * 45.0f);
+}
+
+void Qutee::go_to_rest_pose()
+{
+  this->move_slowly(this->legs_raised_pose(CONFIG_LEG_REST_ANGLE), CONFIG_POSE_TRANSITION_TIME_MS);
+#ifdef CONFIG_TORQUE_OFF_AT_REST
+  this->set_torque(false); // the torso settles on the ground; move_slowly turns the torque back on
+#endif
+}
+
+void Qutee::set_torque(bool on)
+{
+  if(on){
+    // A motor drives to its stored goal when its torque comes on: set the goal to where the joint
+    // is now, so the legs don't jump if they moved while limp
+    State_t state;
+    this->get_motor_positions(state, 6);
+    Actions_t here;
+    for(size_t i = 0; i < DXL_ID_CNT; i++)
+      here(i, 0) = state(6 + i, 0);
+    this->send_actions(here);
+  }
+  // A motor can miss the command (its reply lost on the bus), so read Torque Enable back and retry
+  for(size_t i = 0; i < DXL_ID_CNT; i++){
+    int id = DXL_IDs[i];
+    bool done = false;
+    int attempt;
+    for(attempt = 1; attempt <= 3 && !done; attempt++){
+      if(on)
+        this->_dxl.torqueOn(id);
+      else
+        this->_dxl.torqueOff(id);
+      int32_t enabled = this->_dxl.readControlTableItem(TORQUE_ENABLE, id);
+      done = this->_dxl.getLastLibErrCode() == DXL_LIB_OK && enabled == (on ? 1 : 0);
+    }
+    if(!done){
+      ESP_LOGW("DXL: ","Motor %d: torque did not turn %s", id, on ? "on" : "off");
+      this->_motor_report += "motor " + std::to_string(id) + " torque did not turn " + (on ? "on" : "off") + "; ";
+    } else if(attempt > 2){
+      ESP_LOGW("DXL: ","Motor %d: torque turned %s after %d attempts", id, on ? "on" : "off", attempt - 1);
+    }
+  }
+  this->_torque_on = on;
+  ESP_LOGI("DXL: ","Torque %s", on ? "on" : "off (rest)");
+}
+
+// Stand up through the "legs up" pose, like at boot: at rest (especially with the torque off) the
+// legs drift, hips splayed and knees folded, and can't lift the body from there. Raised, they carry
+// no load and realign; lowered from there, they lift the body.
+void Qutee::go_to_standing_pose()
+{
+  this->move_slowly(this->legs_raised_pose(CONFIG_LEG_UP_ANGLE), CONFIG_POSE_TRANSITION_TIME_MS);
+  this->move_slowly(this->legs_raised_pose(0), CONFIG_POSE_TRANSITION_TIME_MS);
 }
 
 void Qutee::displaySensorStatus(void)
@@ -597,8 +681,12 @@ void Qutee::get_motor_positions(State_t& state_ref, size_t offset)
   // and receive a status packet from each DYNAMIXEL
   // SyncRead stops at the first motor that doesn't answer, so only the first recv_cnt motors
   // are fresh. The others keep their last known position.
+  // Replies get lost now and then, more often while the legs carry the robot (higher currents).
+  // A SyncRead takes about 4 ms of the 20 ms control period, so retry once.
   uint8_t i, recv_cnt;
   recv_cnt = this->_dxl.syncRead(&this->_sr_infos);
+  if(recv_cnt < DXL_ID_CNT)
+    recv_cnt = this->_dxl.syncRead(&this->_sr_infos);
   for(i = 0; i<recv_cnt; i++)
     this->_last_positions[i] = (this->_sr_data[i].present_position-2048.0f)/512.0f;
   if(recv_cnt < DXL_ID_CNT)
@@ -624,10 +712,9 @@ void Qutee::run_episode(){
   this->_motor_report.clear();
   if(this->reboot_faulted_motors(false) > 0)
     this->init_motors(); // a reboot turns torque off and resets the gains
-  this->_incomplete_reads = 0;
-
-  this->go_to_neutral_pose();
+  this->go_to_standing_pose();
   std::this_thread::sleep_for(std::chrono::microseconds(1000000));
+  this->_incomplete_reads = 0; // count only the episode's reads
   int64_t start, sleep_duration;
   int64_t start_loop = esp_timer_get_time();
   for(size_t step = 0;step< NB_STEPS; step++)
@@ -648,13 +735,13 @@ void Qutee::run_episode(){
     else
       ESP_LOGE("Control Loop"," Error: loop duration: %" PRId64" longer than period: ", esp_timer_get_time() - start);
   }
-  this->go_to_neutral_pose();
   ESP_LOGI("Control Loop", "duration of the loop: %" PRId64, esp_timer_get_time() - start_loop);
   if(this->_incomplete_reads > 0){
     ESP_LOGW("Control Loop", "%d of %d motor reads were incomplete; missing positions kept their last value",
              this->_incomplete_reads, (int) NB_STEPS);
     this->_motor_report += std::to_string(this->_incomplete_reads) + " incomplete motor reads; ";
   }
+  this->go_to_rest_pose();
  }
 
 
@@ -665,8 +752,8 @@ void Qutee::checkup(){
   this->_tft.setCursor(0, 0);
   this->_tft.setTextColor(ST77XX_BLUE);
   this->_tft.println("CHECKUP");
-  
-  go_to_neutral_pose();
+
+  go_to_standing_pose();
   std::this_thread::sleep_for(std::chrono::microseconds(1000000));
   int64_t start, sleep_duration;
   int64_t start_loop = esp_timer_get_time();
@@ -710,7 +797,7 @@ void Qutee::checkup(){
       ESP_LOGE("Checkup"," Error: loop duration: %" PRId64" longer than period: ", esp_timer_get_time() - start);
   }
   ESP_LOGI("Checkup", "duration of the loop: %" PRId64, esp_timer_get_time() - start_loop);
-  go_to_neutral_pose();
+  go_to_rest_pose();
   while(!gpio_get_level(GPIO_NUM_0)) delay(10); // wait for release, so the menu doesn't see this press
   delay(50); // debounce
  }
@@ -897,9 +984,9 @@ void Qutee::name_memory(size_t * id, bool write = false){
   err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
   
   if (err != ESP_OK) {
-    ESP_LOGE("NVS STORAGE: ","Error (%s) opening NVS handle!\n", esp_err_to_name(err));
+    ESP_LOGE("NVS STORAGE: ","Error (%s) opening NVS handle!", esp_err_to_name(err));
   } else {
-      ESP_LOGI("NVS STORAGE: ","Done\n");
+      ESP_LOGI("NVS STORAGE: ","Done");
       size_t  required_size = 1 * sizeof(size_t);
       ESP_LOGI("NVS STORAGE: ","handling %d bits.", required_size);
       if(write){// WRITE
