@@ -3,8 +3,8 @@
 This guide covers building the firmware, flashing it, watching the robot's logs and starting it in ROS mode, on Windows and on Linux.
 
 > **Status: work in progress.**
-> - **Tested:** building the firmware, flashing and monitoring on Windows 11, boot, screen and menu, battery monitor.
-> - **Not tested yet:** the motors (they must be configured first, see [Setting up the motors](#setting-up-the-motors)), the connection to the micro-ROS agent, the ROS services, and the whole Linux section.
+> - **Tested on Windows 11:** building the firmware, flashing and monitoring, boot, screen and menu, battery monitor, the motors and the checkup, the connection to the micro-ROS agent, and the `status` and `rollout` services.
+> - **Not tested yet:** the whole Linux section, and the IMU (our robot has none fitted).
 
 ## Contents
 - [Hardware](#hardware)
@@ -22,7 +22,7 @@ This guide covers building the firmware, flashing it, watching the robot's logs 
 | Part | Notes |
 |---|---|
 | Adafruit **ESP32-S3 TFT Feather** (regular, not Reverse) | One button (**Boot**, labelled D0), 240x135 screen. The upstream project uses the Reverse TFT; see [the last section](#building-for-the-reverse-tft-feather) for that board. |
-| 12 x Dynamixel XL330-M288-T | IDs 11-13, 21-23, 31-33, 41-43 (leg x 10 + joint), 3 Mbps, protocol 2.0. Data on the Feather's A0/A1 pins. |
+| 12 x Dynamixel XL330-M288-T | IDs 11-13, 21-23, 31-33, 41-43 (leg x 10 + joint), 3 Mbps, protocol 2.0. Data on the Feather's A0/A1 pins. An XL330-M077 also works (same control table and position scale) but has less than half the torque and is about 3.7 times faster, so that joint is weaker; our robot has one at ID 11. |
 | ROBOTIS U2D2 PHB power board | Powers the motors and the Feather (VBAT pin). The U2D2 USB adapter in the same set is used to configure the motors. |
 | 4.8 V NiMH battery | About 5.5 V when fully charged. The Feather's MAX17048 monitor reads it. |
 | BNO055 IMU (optional) | STEMMA QT connector. Without it, the firmware runs and reports orientation and acceleration as zero. |
@@ -156,13 +156,17 @@ If you use pyserial's `miniterm` instead, add `--exit-char 24` so **Ctrl+X** qui
 
 ### Run the micro-ROS agent
 
-In a WSL terminal:
+In a WSL terminal, start it in the background with a name:
 
 ```bash
-docker run -it --rm -p 8888:8888/udp microros/micro-ros-agent:humble udp4 --port 8888 -v6
+docker run -d --name qutee_agent -p 8888:8888/udp microros/micro-ros-agent:humble udp4 --port 8888 -v6
 ```
 
-If the robot can't reach it, enable **Docker Desktop → Settings → Resources → Network → Enable host networking** and use `--net=host` instead of `-p 8888:8888/udp`.
+- Watch it with `docker logs -f --tail 50 qutee_agent` (Ctrl+C stops watching, not the agent). When the robot connects you see `session established` and two `replier created` lines (the `status` and `rollout` services).
+- Stop it with `docker stop qutee_agent`; start it again with `docker start qutee_agent`.
+- Only one agent can use port 8888. `port is already allocated` means one is already running: check with `docker ps`.
+- The agent can keep running while you reset the robot: the robot reconnects with the same client key and the agent replaces its old session.
+- Use `-p 8888:8888/udp`, not `--net=host`. On Windows, Docker Desktop's host networking makes the robot's packets appear to come from `127.0.0.1`, so the agent's replies never reach the robot ("Agent unreachable" on the screen).
 
 ## Linux
 
@@ -264,10 +268,64 @@ The screen shows the robot's name and "ROS mode", and the status line shows:
 | Agent unreachable: start it, then reset | Start the agent (and check the IP, firewall and networking), then press **Reset**. |
 
 When connected, the robot offers two services under its name (for example `/qutee/status` and `/qutee/rollout`):
-- **status**: battery voltage, number of policy weights, error message.
+- **status**: battery voltage, number of policy weights, and `error_message`: motor problems found during the last rollout (empty if none, see [Motor faults during rollouts](#motor-faults-during-rollouts)).
 - **rollout**: runs one episode (`EPISODE_DURATION` seconds at `CONTROL_FREQUENCY` Hz, both in menuconfig) with the neural network weights you send, and returns the states and actions.
 
-Calling them needs ROS 2 Humble and the `qutee_interface` package (`software/main/src/Qutee_interface`) built in a ROS 2 workspace. This hasn't been tested yet.
+### Calling the services
+
+You need ROS 2 Humble with the `qutee_interface` package (`software/main/src/Qutee_interface`). The simplest way is a `ros:humble` container next to the agent. In a WSL terminal (or Linux), from `software/`:
+
+```bash
+docker run -it --rm -v "$(pwd)/main/src/Qutee_interface":/ws/src/qutee_interface:ro ros:humble bash
+```
+
+On Linux, add `--net=host` (the agent runs with `--net=host` there). On Windows, leave it out: the container and the agent share Docker's network. Inside the container:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /ws && colcon build --packages-select qutee_interface
+source install/setup.bash
+ros2 service list                                           # shows /qutee/rollout and /qutee/status
+ros2 service call /qutee/status qutee_interface/srv/Status
+```
+
+The status reply looks like `Status_Response(battery=5.15, number_weights=322, error_message='')`. If `ros2 service list` shows nothing just after starting the container, wait a few seconds for ROS 2 discovery and try again.
+
+To run a rollout, send the weights from Python (the `ros:humble` image includes numpy). **The legs move**: put the robot on a stand the first time.
+
+```bash
+python3 - <<'EOF'
+import numpy as np, rclpy
+from qutee_interface.srv import Rollout
+from std_msgs.msg import Float32MultiArray
+
+rclpy.init()
+node = rclpy.create_node("rollout_example")
+client = node.create_client(Rollout, "/qutee/rollout")
+client.wait_for_service()
+request = Rollout.Request()
+request.weights = Float32MultiArray(data=np.random.uniform(-0.1, 0.1, 322).astype(np.float32).tolist())
+future = client.call_async(request)
+rclpy.spin_until_future_complete(node, future)
+reply = future.result()
+states = np.array(reply.states.data).reshape(-1, 18)
+actions = np.array(reply.actions.data).reshape(-1, 12)
+print("states", states.shape, "actions", actions.shape)
+EOF
+```
+
+The reply comes after about 6.5 s: 1 s to go to the neutral pose, then the episode.
+
+### Rollout data
+
+- **Policy**: a neural network with 18 inputs, `NB_HIDDEN_LAYERS` hidden layers of `NB_NEURONS_PER_LAYER` neurons (menuconfig; 1 x 10 by default) and 12 outputs, all with tanh. Use `number_weights` from `status` (322 by default). The weights are the layers' matrices one after the other, each stored column by column (Eigen's default) with the bias in the last column: by default first the 10 x 19 input layer (index = neuron + 10 x input, input 18 is the bias), then the 12 x 11 output layer.
+- **states**: one row per step, 18 values: orientation x, y, z (rad) and linear acceleration x, y, z (m/s²) from the IMU (zeros without one), then the 12 joint positions.
+- **actions**: one row per step, 12 values in [-1, 1].
+- Joint positions and actions use the same scale: 0 is the neutral pose and 1 is 45°. The joint order is 11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43.
+
+### Motor faults during rollouts
+
+Large weights (for example ±1) make the joints swing between ±45° at full speed, and a motor that can't keep up can trip on **overload** (its LED blinks red and its torque turns off). Before each rollout the firmware reboots any motor in that state and sets it up again, and `status` then reports it in `error_message`, for example `motor 43 overload (rebooted);`. `error_message` also reports `N incomplete motor reads;` when some position reads failed during the episode (the state then keeps the last known position for those motors). Check `error_message` after each rollout and treat a non-empty one as a sign that the episode's data may be unreliable.
 
 ## Setting up the motors
 
@@ -292,7 +350,8 @@ When all 12 are set, the boot screen should show "Motors found: 12/12".
 | A motor's LED blinks red | The motor has a hardware error and has turned its torque off. The most common cause is powering the robot through USB with the battery off: the Feather's charger then feeds the motors through VBAT at too low a voltage. At boot the firmware waits for the battery and reboots motors with an error, logging each motor's voltage and error bits (`input-voltage`, `overheating`, `encoder`, `electrical-shock`, `overload`). If it comes back, read **Hardware Error Status** (address 70) in Dynamixel Wizard. |
 | `Wire.cpp ... requestFrom(): ... Error -1` at boot | Printed while the battery monitor resets. Harmless. |
 | `Detected size(4096k) larger than the size in the binary image header(2048k)` | Harmless: the firmware uses 2 MB of the board's 4 MB flash. |
-| Robot can't reach the agent from Windows | Check mirrored networking (`hostname -I` in WSL shows the Windows IP), the firewall rule, that the WiFi network is Private, and the Agent IP in menuconfig. |
+| Robot can't reach the agent from Windows | Check mirrored networking (`hostname -I` in WSL shows the Windows IP), the firewall rule, that the WiFi network is Private, the Agent IP in menuconfig, and that the agent runs with `-p 8888:8888/udp` (not `--net=host`). |
+| `ros2 service list` doesn't show the robot's services | Check that the robot shows "Connected to agent, ready" and that the agent's log (`docker logs qutee_agent`) shows two `replier created` lines for its session. |
 
 ## Building for the Reverse TFT Feather
 
