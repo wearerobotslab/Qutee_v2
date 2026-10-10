@@ -34,3 +34,7 @@
 [submodule "software/main/src/Qutee_interface"]
 	path = software/main/src/Qutee_interface
 	url = https://github.com/adaptive-intelligent-robotics/Qutee_interface.git
+[submodule "software/components/intrinsic_motivations"]
+	path = software/components/intrinsic_motivations
+	url = https://github.com/wearerobotslab/intrinsic_motivations.git
+	branch = embedded_homeokinesis

@@ -207,6 +207,7 @@ void Qutee::tft_load_screen() {
 
 // Show a one-line status message at the bottom of the screen (below the data screen's last row)
 void Qutee::tft_status(const char* msg, uint16_t color) {
+  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
   this->_tft.fillRect(0, 128, 240, 8, ST77XX_BLACK);
   this->_tft.setTextWrap(false);
   this->_tft.setTextSize(1);
@@ -461,13 +462,27 @@ void Qutee::check_motor_power()
 // Reboot the motors with a latched hardware error (a fault turns the motor's torque off until it
 // is rebooted), and add each fault to _motor_report. Returns the number of motors rebooted.
 // The caller must set up the rebooted motors again (init_motors), since a reboot resets them.
+// Hardware Error Status of a motor: 0 if none, -1 if it couldn't be read. It is one byte with only bits
+// 0, 2, 3, 4 and 5 used, so anything else is a garbled reply (seen once as 0x9e0) and is reported as -1.
+int32_t Qutee::read_hardware_error(int id)
+{
+  int32_t error = this->_dxl.readControlTableItem(HARDWARE_ERROR_STATUS, id);
+  if(this->_dxl.getLastLibErrCode() != DXL_LIB_OK)
+    return -1;
+  if(error & ~0x3D){
+    ESP_LOGW("DXL: ", "Motor %d: ignoring an invalid hardware error reading 0x%lx", id, (long) error);
+    return -1;
+  }
+  return error;
+}
+
 int Qutee::reboot_faulted_motors(bool log_healthy)
 {
   int rebooted = 0;
   for(int i = 0; i < DXL_ID_CNT; i++){
     int id = DXL_IDs[i];
-    int32_t error = this->_dxl.readControlTableItem(HARDWARE_ERROR_STATUS, id);
-    if(this->_dxl.getLastLibErrCode() != DXL_LIB_OK)
+    int32_t error = this->read_hardware_error(id);
+    if(error < 0)
       continue;
     float voltage = this->_dxl.readControlTableItem(PRESENT_INPUT_VOLTAGE, id) / 10.0f;
     if(error == 0){
@@ -490,8 +505,8 @@ int Qutee::reboot_faulted_motors(bool log_healthy)
 
   for(int i = 0; i < DXL_ID_CNT; i++){
     int id = DXL_IDs[i];
-    int32_t error = this->_dxl.readControlTableItem(HARDWARE_ERROR_STATUS, id);
-    if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && error != 0){
+    int32_t error = this->read_hardware_error(id);
+    if(error > 0){
       ESP_LOGE("DXL: ","Motor %d still has hardware error 0x%02lx after a reboot", id, (long) error);
       this->_motor_report += "motor " + std::to_string(id) + " still faulty after reboot; ";
       char msg[40];
@@ -510,10 +525,16 @@ void Qutee::init_motors()
   {   
     this->_dxl.torqueOff(this->DXL_IDs[i]);
     this->_dxl.setOperatingMode(this->DXL_IDs[i], OP_POSITION);
+    // Time-based motion profile (Drive Mode bit 2, an EEPROM item, so with the torque off): Profile Velocity
+    // is then the time to reach a target (see set_servo_motion). Keep the other bits (bit 0 reverses the motor).
+    int32_t drive_mode = this->_dxl.readControlTableItem(DRIVE_MODE, DXL_IDs[i]);
+    if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && !(drive_mode & 0x04))
+      this->_dxl.writeControlTableItem(DRIVE_MODE, DXL_IDs[i], drive_mode | 0x04);
     this->_dxl.torqueOn(this->DXL_IDs[i]);
     ESP_LOGI("DXL: ","TORQUE ON" );
-    // Limit the maximum velocity in Position Control Mode. Use 0 for Max speed
+    // No motion profile (0): the motor reaches each target as fast as it can
     this->_dxl.writeControlTableItem(PROFILE_VELOCITY, DXL_IDs[i], 0);
+    this->_dxl.writeControlTableItem(PROFILE_ACCELERATION, DXL_IDs[i], 0);
     this->set_PID_gains();
   }
   this->_torque_on = true;
@@ -571,12 +592,24 @@ void Qutee::move_slowly(const Actions_t& target, int duration_ms)
            state(6 + 7, 0) * 45.0f, state(6 + 10, 0) * 45.0f);
 }
 
+// With the time-based profile (set in init_motors), Profile Velocity is the time to reach each new target and
+// Profile Acceleration the time spent accelerating; 0 means as fast as possible. Both are RAM: they can change
+// while the torque is on.
+void Qutee::set_servo_motion(int profile_ms, int p_gain)
+{
+  for(size_t i = 0; i < DXL_ID_CNT; i++){
+    this->_dxl.writeControlTableItem(PROFILE_VELOCITY, DXL_IDs[i], profile_ms);
+    this->_dxl.writeControlTableItem(PROFILE_ACCELERATION, DXL_IDs[i], profile_ms / 4);
+    this->_dxl.writeControlTableItem(POSITION_P_GAIN, DXL_IDs[i], p_gain);
+  }
+  ESP_LOGI("DXL: ", "Servo profile %d ms, P gain %d", profile_ms, p_gain);
+}
+
 void Qutee::go_to_rest_pose()
 {
   this->move_slowly(this->legs_raised_pose(CONFIG_LEG_REST_ANGLE), CONFIG_POSE_TRANSITION_TIME_MS);
-#ifdef CONFIG_TORQUE_OFF_AT_REST
-  this->set_torque(false); // the torso settles on the ground; move_slowly turns the torque back on
-#endif
+  if(this->_torque_off_at_rest)
+    this->set_torque(false); // the torso settles on the ground; move_slowly turns the torque back on
 }
 
 void Qutee::set_torque(bool on)
@@ -1012,6 +1045,7 @@ void Qutee::name_memory(size_t * id, bool write = false){
 // The backlight stays on (dim) so the status line shows that the robot is running.
 void Qutee::enter_ros_mode(){
   if(this->_imu_available && !this->_bno.isFullyCalibrated()) {this->calibration();}
+  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
   this->_tft.fillScreen(ST77XX_BLACK);
   this->_tft.setCursor(0, 30);
   this->_tft.setTextSize(2);
@@ -1020,38 +1054,236 @@ void Qutee::enter_ros_mode(){
   this->_tft.println("ROS mode");
 }
 
-void Qutee::menu(){
+// ----- Homeokinesis ----- //
+
+int Qutee::poll_button(){
+  bool pressed = !gpio_get_level(GPIO_NUM_0); // D0 is active low
+  int64_t now = esp_timer_get_time();
+  if(pressed && !this->_btn_down){
+    this->_btn_down = true;
+    this->_btn_long = false;
+    this->_btn_start = now;
+  } else if(pressed && !this->_btn_long && now - this->_btn_start > LONG_PRESS_US){
+    this->_btn_long = true;
+    return 2;
+  } else if(!pressed && this->_btn_down){
+    this->_btn_down = false;
+    if(!this->_btn_long && now - this->_btn_start > 30000) // debounce
+      return 1;
+  }
+  return 0;
+}
+
+void Qutee::hk_screen(){
+  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+  this->_tft.fillRect(0, 0, 240, 128, ST77XX_BLACK);
+  this->_tft.setTextWrap(false);
+  this->_tft.setTextSize(2);
+  this->_tft.setCursor(0, 10);
+  this->_tft.setTextColor(ST77XX_YELLOW);
+  this->_tft.println("Homeokinesis");
+  this->_tft.setCursor(0, 50);
+  this->_tft.setTextColor(this->_hk_running ? ST77XX_GREEN : ST77XX_RED);
+  this->_tft.println(this->_hk_running ? "Running" : "Stopped (rest)");
+  this->_tft.setTextSize(1);
+  this->_tft.setCursor(0, 90);
+  this->_tft.setTextColor(ST77XX_WHITE);
+  this->_tft.println("Press: stop/start   Hold: menu");
+}
+
+void Qutee::hk_task(void* robot){
+  static_cast<Qutee*>(robot)->hk_loop();
+  xSemaphoreGive(static_cast<Qutee*>(robot)->_hk_done);
+  vTaskDelete(NULL);
+}
+
+// The controller's matrix work needs more stack than the main task has, so it runs in its own task
+void Qutee::run_homeokinesis(){
+  if(!this->_hk_done)
+    this->_hk_done = xSemaphoreCreateBinary();
+  xTaskCreate(hk_task, "homeokinesis", CONFIG_ROBOT_CTRL_APP_STACK, this, CONFIG_ROBOT_CTRL_APP_TASK_PRIO, NULL);
+  xSemaphoreTake(this->_hk_done, portMAX_DELAY);
+}
+
+void Qutee::hk_loop(){
+  while(!gpio_get_level(GPIO_NUM_0)) delay(10); // release of the press that chose the menu entry
+  this->_btn_down = false;
+  this->_hk_run_request = -1;
+  this->_hk_reset_request = false;
+  this->_hk_settings_changed = true;
+  this->_hk.reset();
+  this->_hk_active = true;
+
+  this->_motor_report.clear();
+  if(this->reboot_faulted_motors(false) > 0)
+    this->init_motors();
+  this->go_to_standing_pose();
+  this->_hk_running = true;
+  this->hk_screen();
+  ESP_LOGI("HK", "Homeokinesis started");
+
+  State_t state;
+  Homeokinesis_t::SensorVec x;
+  Homeokinesis_t::MotorVec target = Homeokinesis_t::MotorVec::Zero(); // smoothed motor targets (0 = standing)
+  Actions_t actions;
+  float amplitude = 0, smoothing = 0, sensor_noise = 0, motor_noise = 0;
+  // Uniform white noise in [-n, n], from the hardware random number generator
+  auto noise = [](float n) { return n == 0.0f ? 0.0f : (esp_random() * (2.0f / 4294967295.0f) - 1.0f) * n; };
+  int servo_profile_ms = 0, servo_p_gain = 1600; // as set by init_motors and set_PID_gains
+  size_t fault_check = 0; // motor whose hardware error status is read this step (one per step)
+  int64_t step_us_sum = 0, step_us_max = 0;
+  int steps_in_log = 0;
+  this->_incomplete_reads = 0;
+  int64_t next = esp_timer_get_time();
+  while(true){
+    // Button: short press stops or restarts, long press goes back to the menu
+    int button = this->poll_button();
+    if(button == 2)
+      break;
+    int request = this->_hk_run_request.exchange(-1);
+    if(button == 1)
+      request = this->_hk_running ? 0 : 1;
+    if(request != -1 && (request == 1) != this->_hk_running){
+      if(request == 1){
+        if(this->reboot_faulted_motors(false) > 0)
+          this->init_motors();
+        this->go_to_standing_pose();
+      } else {
+        this->go_to_rest_pose();
+      }
+      this->_hk_running = (request == 1);
+      target.setZero();
+      ESP_LOGI("HK", "Homeokinesis %s", this->_hk_running ? "running" : "stopped");
+      this->hk_screen();
+      next = esp_timer_get_time();
+    }
+    if(this->_hk_reset_request.exchange(false)){
+      this->_hk.reset();
+      ESP_LOGI("HK", "Controller reset");
+    }
+    if(this->_hk_settings_changed.exchange(false)){
+      HkSettings s = this->hk_settings();
+      auto& p = this->_hk.params();
+      p.epsA = s.epsA; p.epsC = s.epsC;
+      p.creativity = s.creativity; p.harmony = s.harmony; p.damping = s.damping; p.causeaware = s.causeaware;
+      p.steps4Delay = s.steps4Delay; p.steps4Averaging = s.steps4Averaging;
+      amplitude = s.amplitude;
+      smoothing = s.motorSmoothing;
+      sensor_noise = s.sensorNoise;
+      motor_noise = s.motorNoise;
+      if(s.servoProfileMs != servo_profile_ms || s.servoPGain != servo_p_gain){
+        servo_profile_ms = s.servoProfileMs;
+        servo_p_gain = s.servoPGain;
+        this->set_servo_motion(servo_profile_ms, servo_p_gain);
+      }
+      ESP_LOGI("HK", "Settings: eps_A %g, eps_C %g, creativity %g, harmony %g, damping %g, causeaware %g, "
+               "steps_delay %d, steps_averaging %d, amplitude %g, motor_smoothing %g, sensor_noise %g, "
+               "motor_noise %g", p.epsA, p.epsC, p.creativity, p.harmony, p.damping, p.causeaware, p.steps4Delay,
+               p.steps4Averaging, amplitude, smoothing, sensor_noise, motor_noise);
+    }
+
+    if(this->_hk_running){
+      // Sensors: the 12 joint positions (1 = 45 deg); motors: the 12 joint targets
+      this->get_motor_positions(state, 6);
+      for(size_t i = 0; i < DXL_ID_CNT; i++)
+        x(i) = state(6 + i, 0) + noise(sensor_noise);
+      int64_t t0 = esp_timer_get_time();
+      const Homeokinesis_t::MotorVec& y = this->_hk.step(x);
+      int64_t step_us = esp_timer_get_time() - t0;
+      Homeokinesis_t::MotorVec y_noisy;
+      for(size_t i = 0; i < DXL_ID_CNT; i++)
+        y_noisy(i) = std::clamp(y(i) + noise(motor_noise), -1.0f, 1.0f);
+      target += (y_noisy * amplitude - target) * (1.0f - smoothing);
+      for(size_t i = 0; i < DXL_ID_CNT; i++)
+        actions(i, 0) = target(i);
+      this->send_actions(actions);
+
+      // A motor that trips (e.g. overload) goes limp: stop rather than carry on with a dead joint.
+      // A garbled reply can look like an error, so stop only on a valid value read twice.
+      int id = DXL_IDs[fault_check];
+      fault_check = (fault_check + 1) % DXL_ID_CNT;
+      int32_t error = this->read_hardware_error(id);
+      if(error > 0)
+        error = (this->read_hardware_error(id) == error) ? error : 0;
+      if(error > 0){
+        ESP_LOGW("HK", "Motor %d hardware error 0x%02lx%s: stopping", id, (long) error, (error & 0x20) ? " (overload)" : "");
+        this->_motor_report += "homeokinesis stopped: motor " + std::to_string(id) + " hardware error; ";
+        this->go_to_rest_pose();
+        this->_hk_running = false;
+        this->hk_screen();
+        char msg[40];
+        snprintf(msg, sizeof(msg), "Motor %d fault: stopped", id);
+        this->tft_status(msg, ST77XX_RED);
+        next = esp_timer_get_time();
+        continue;
+      }
+
+      step_us_sum += step_us;
+      step_us_max = std::max(step_us_max, step_us);
+      if(++steps_in_log == CONFIG_CONTROL_FREQUENCY){
+        ESP_LOGI("HK", "step %ld: controller %lld us (max %lld), |y| %.2f, |C| %.2f, |A| %.2f, |error| %.3f, "
+                 "incomplete reads %d", this->_hk.steps(), step_us_sum / steps_in_log, step_us_max, y.norm(),
+                 this->_hk.C().norm(), this->_hk.A().norm(), this->_hk.prediction_error().norm(),
+                 this->_incomplete_reads);
+        step_us_sum = step_us_max = 0;
+        steps_in_log = 0;
+        this->_incomplete_reads = 0;
+      }
+    }
+
+    next += PERIOD;
+    int64_t wait = next - esp_timer_get_time();
+    if(wait > 0)
+      std::this_thread::sleep_for(std::chrono::microseconds(wait));
+    else
+      next = esp_timer_get_time(); // late: don't try to catch up
+  }
+
+  if(this->_hk_running)
+    this->go_to_rest_pose();
+  if(servo_profile_ms != 0 || servo_p_gain != 1600)
+    this->set_servo_motion(0, 1600); // back to what rollouts and the checkup expect
+  this->_hk_running = false;
+  this->_hk_active = false;
+  ESP_LOGI("HK", "Homeokinesis left, back to the menu");
+}
+
+Qutee::MenuChoice Qutee::menu(){
   gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
 #if !QUTEE_THREE_BUTTONS
-  const char* items[] = {"Select Name", "Start Checkup", "Start ROS"};
-  const uint16_t colors[] = {ST77XX_GREEN, ST77XX_RED, ST77XX_BLUE};
+  const char* items[] = {"Select Name", "Start Checkup", "Start ROS", "Homeokinesis"};
+  const uint16_t colors[] = {ST77XX_GREEN, ST77XX_RED, ST77XX_BLUE, ST77XX_YELLOW};
+  const size_t nb_items = 4;
   size_t highlighted = 0;
   while(!gpio_get_level(GPIO_NUM_0)) delay(10); // wait for the button to be released
   while(1){
-    this->_tft.setTextWrap(false);
-    this->_tft.fillScreen(ST77XX_BLACK);
-    this->_tft.setTextSize(2);
-    for(size_t i = 0; i < 3; i++){
-      this->_tft.setCursor(0, i * 40);
-      this->_tft.setTextColor(colors[i]);
-      this->_tft.print(i == highlighted ? "> " : "  ");
-      this->_tft.println(items[i]);
+    {
+      std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+      this->_tft.setTextWrap(false);
+      this->_tft.fillScreen(ST77XX_BLACK);
+      this->_tft.setTextSize(2);
+      for(size_t i = 0; i < nb_items; i++){
+        this->_tft.setCursor(0, i * 30);
+        this->_tft.setTextColor(colors[i]);
+        this->_tft.print(i == highlighted ? "> " : "  ");
+        this->_tft.println(items[i]);
+      }
     }
     this->tft_status("Press: next   Hold: select");
     ESP_LOGI("Menu", "Entering menu. Waiting for a button to be pressed");
 
     if(!this->wait_button_press()){
-      highlighted = (highlighted + 1) % 3;
+      highlighted = (highlighted + 1) % nb_items;
       continue;
     }
     if(highlighted == 0)
       this->select_name();
     else if(highlighted == 1)
       this->checkup(); // runs until the button is pressed
-    else {
-      this->enter_ros_mode();
-      return;
-    }
+    else if(highlighted == 2)
+      return MenuChoice::Ros;
+    else
+      return MenuChoice::Homeokinesis;
   }
 #else
   bool screen_on = false;
@@ -1094,10 +1326,8 @@ void Qutee::menu(){
       this->checkup(); // runs until D0 is pressed
       screen_on=false; // replot the menu
     }
-    if(gpio_get_level(GPIO_NUM_2)){
-      this->enter_ros_mode();
-      return;
-    }
+    if(gpio_get_level(GPIO_NUM_2))
+      return MenuChoice::Ros; // the three-button menu has no homeokinesis entry
 
   }
 #endif

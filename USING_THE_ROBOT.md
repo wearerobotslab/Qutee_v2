@@ -139,7 +139,7 @@ Then, from the build folder (the WSL path works directly from Windows):
 
 ```powershell
 cd \\wsl.localhost\Ubuntu\home\<user>\Qutee_v2\software\build
-python -m esptool --chip esp32s3 -p COM3 -b 460800 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 40m --flash-size 2MB 0x0 bootloader\bootloader.bin 0x8000 partition_table\partition-table.bin 0x10000 QuteeV2.bin
+python -m esptool --chip esp32s3 -p COM3 -b 460800 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 40m --flash-size 4MB 0x0 bootloader\bootloader.bin 0x8000 partition_table\partition-table.bin 0x10000 QuteeV2.bin
 ```
 
 - If esptool can't connect: hold **Boot**, press and release **Reset**, release **Boot**, and try again (the port number may change in this mode). Press **Reset** after flashing.
@@ -281,6 +281,7 @@ Options:
 - **Select Name**: pick the robot's name from the list set in menuconfig (short press: next name, long press: choose). The choice is remembered across reboots. Until a name is chosen, the robot uses the first name in the list.
 - **Start Checkup**: stands up, then moves all motors in a slow sine wave and shows each motor's average position error, one row per leg and one column per joint. Values above 0.1 are red. Hold **Boot** until the menu comes back to stop it; the robot then goes back to rest.
 - **Start ROS**: connects to WiFi and the micro-ROS agent. You can't go back to the menu from ROS mode; press **Reset**.
+- **Homeokinesis**: connects to WiFi and the agent (if not already connected), stands up and runs the homeokinesis controller (see [Homeokinesis](#homeokinesis)). Short press: stop (rest) or start again. Long press: back to the menu, without restarting (WiFi and ROS stay connected).
 
 ### ROS mode
 
@@ -355,6 +356,42 @@ The reply comes after about 10 s: the robot stands up from rest (legs up, then s
 
 Large weights (for example ±1) make the joints swing between ±45° at full speed, and a motor that can't keep up can trip on **overload** (its LED blinks red and its torque turns off). Before each rollout the firmware reboots any motor in that state and sets it up again, and `status` then reports it in `error_message`, for example `motor 43 overload (rebooted);`. `error_message` also reports `N incomplete motor reads;` when some position reads failed during the episode even after a retry (the state then keeps the last known position for those motors; replies get lost more often while the legs carry the robot), and `motor N torque did not turn on;` when a motor didn't accept the command after 3 attempts. Check `error_message` after each rollout and treat a non-empty one as a sign that the episode's data may be unreliable.
 
+## Homeokinesis
+
+Homeokinesis is a self-organising controller ("Sox", from The Playful Machine, Der and Martius, 2012): it learns a model of how its commands move the joints and continually adapts its controller to stay at the edge of instability, so movement emerges by itself. It runs on the robot, at 50 Hz, with the 12 joint positions as sensors and the 12 joint targets as outputs. The code is the portable C++ version in the `intrinsic_motivations` submodule (`software/components/intrinsic_motivations/cpp/homeokinesis/portable`).
+
+**Start:** choose **Homeokinesis** in the menu, on the floor. **Stop:** short press (the robot goes to rest; press again to restart), or `ros2 param set /qutee/qutee_node running false`. **Leave:** long press, back to the menu. While homeokinesis is chosen, `rollout` is refused.
+
+**Parameters**, from a ROS 2 shell (a WSL terminal on Windows; add `--net=host` on Linux):
+
+```bash
+docker run -it --rm --name qutee_ros -v ~/hk_params:/params ros:humble bash
+source /opt/ros/humble/setup.bash
+ros2 param dump /qutee/qutee_node                   # all values
+ros2 param set /qutee/qutee_node eps_C 0.3          # decimals for decimal parameters ("0.0", not "0")
+ros2 param dump /qutee/qutee_node > /params/good.yaml        # save a set of values
+ros2 param load /qutee/qutee_node /params/good.yaml          # restore it (the robot starts with the defaults)
+```
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `eps_C`, `eps_A` | 0.5, 0.5 | Learning rates of the controller and the model. The learning keeps the robot moving: with them at 0, it stops. |
+| `amplitude` | 0.8 | Joint targets = output × amplitude (1 = ±45°). |
+| `sensor_noise`, `motor_noise` | 0.05, 0.05 | Uniform white noise in [-n, n] (1 = 45°) added to each joint reading and to each output. Homeokinesis amplifies fluctuations; the servos are too precise to provide them, so without noise the robot may need a push to start. |
+| `servo_p_gain` | 400 | Servo stiffness while homeokinesis runs (rollouts and poses use 1600). Softer means fewer overloads. |
+| `servo_profile_ms` | 20 | Time each servo takes to reach a new target (0 = as fast as possible): smoother movement and lower current peaks. |
+| `motor_smoothing` | 0 | Filters the targets (0 to 0.99). |
+| `creativity`, `harmony`, `damping`, `causeaware` | 0.1, 0.1, 1e-5, 0.01 | Further Sox parameters. |
+| `steps_delay`, `steps_averaging` | 10 (used as 9) | Delay between a command and its effect, and sensor smoothing, in steps (1 to 9). |
+| `torque_off_at_rest` | menuconfig | Turn off when the robot hangs on a stand: there the released legs fall and the knees can trip. |
+| `running`, `reset` | | Start/stop; `reset true` clears what the controller has learned. |
+
+The defaults were tuned on the floor; they reset whenever the robot restarts, so save good values with `ros2 param dump` and load them after a start.
+
+**Safety:** each step one motor's error status is read. If a motor trips (red LED, usually overload), homeokinesis stops, the robot goes to rest, the screen shows "Motor N fault: stopped" and `status` reports it; the next start reboots the motor. Overloads come from a strong loop (high amplitude, stiff servos) with joints pushing against the floor. Several motors tripping at once with `input-voltage` errors means a weak battery: charge it.
+
+**Log:** every second, `HK: step …` shows the controller's step time (about 4.5 ms of the 20 ms period), `|y|`, `|C|`, `|A|`, the prediction error and incomplete reads.
+
 ## Setting up the motors
 
 The firmware expects the motors at IDs 11-13, 21-23, 31-33, 41-43 (leg x 10 + joint, matching the numbers on the robot's body) and 3 Mbps. New XL330s come as ID 1 at 57600 baud, so each one must be configured once. Use ROBOTIS **Dynamixel Wizard 2.0** (Windows and Linux) with the U2D2:
@@ -379,7 +416,8 @@ When all 12 are set, the boot screen should show "Motors found: 12/12".
 | Motors turn red when the robot goes to rest | The legs were still carrying the robot when the torque turned off. Increase "Leg angle of the rest pose" until the torso rests on the ground first (see [Poses](#poses)). |
 | The robot doesn't stand up at the start of a rollout | Check the battery (`status`): below about 4.9 V the motors may not lift the body. The serial or WiFi log shows where joint 2 of each leg ended up after each move (`Pose: joint 2 target ... reached ...`). |
 | `Wire.cpp ... requestFrom(): ... Error -1` at boot | Printed while the battery monitor resets. Harmless. |
-| `Detected size(4096k) larger than the size in the binary image header(2048k)` | Harmless: the firmware uses 2 MB of the board's 4 MB flash. |
+| `Detected size(4096k) larger than the size in the binary image header(2048k)` | Firmware from before the homeokinesis branch, which used 2 MB of the 4 MB flash. Harmless. The current firmware uses all 4 MB (flash with `--flash-size 4MB`). |
+| After flashing, `ros2 param get` times out, or some of the robot's services are missing | The new firmware creates different services, and the agent reused the old ones by number (the robot reconnects with the same client key). Restart the agent once: `docker restart qutee_agent`, then reset the robot. |
 | Robot can't reach the agent from Windows | Check mirrored networking (`hostname -I` in WSL shows the Windows IP), the firewall rule, that the WiFi network is Private, the Agent IP in menuconfig, and that the agent runs with `-p 8888:8888/udp` (not `--net=host`). |
 | `ros2 service list` doesn't show the robot's services | Check that the robot shows "Connected to agent, ready" and that the agent's log (`docker logs qutee_agent`) shows two `replier created` lines for its session. |
 

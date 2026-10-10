@@ -108,6 +108,7 @@ idf_component_register(SRCS "main.cpp"
                                 "../components/Adafruit_Sensor/"
                                 "../components/Adafruit_BNO055/"
                                 "../components/Adafruit_MAX1704X/"
+                                "../components/intrinsic_motivations/cpp/homeokinesis/portable/"
                  
 
 
@@ -120,6 +121,8 @@ idf_component_register(SRCS "main.cpp"
 
                     )
 set_target_properties(${COMPONENT_LIB} PROPERTIES COMPILE_FLAGS "-Wno-maybe-uninitialized -Wimplicit-function-declaration -fpermissive")
+# The project builds with -Og (debug); Eigen needs optimisation: one homeokinesis step took ~23 ms at -Og
+target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
 
 
 add_prebuilt_library(libquteeinterface ""

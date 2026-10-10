@@ -13,10 +13,15 @@
 #undef LOW // undef macro from arduino lib
 
 
+#include <atomic>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <sstream>
 #include <vector>
+
+// Homeokinesis controller, from the intrinsic_motivations submodule (components/intrinsic_motivations)
+#include "homeokinesis.hpp"
 
 
 #include "nvs_flash.h"
@@ -74,19 +79,55 @@ public:
   float battery_voltage();
   std::string get_name(){return this->name;}
   void checkup();
-  void menu();
+  enum class MenuChoice { Ros, Homeokinesis };
+  MenuChoice menu();
+  void enter_ros_mode();
   void tft_status(const char* msg, uint16_t color = ST77XX_WHITE);
   // Motor problems found during the last episode (empty if none), reported by the status service
   const std::string& get_motor_report(){return _motor_report;}
+  void set_motor_report(const std::string& report){_motor_report = report;}
+  // Turn the torque off in the rest pose (default from menuconfig). Off when the robot hangs on a stand:
+  // there the legs fall freely when released, and the back-driven motors can trip (input voltage error).
+  bool torque_off_at_rest() const {return _torque_off_at_rest;}
+  void set_torque_off_at_rest(bool on){_torque_off_at_rest = on;}
+
+  // ----- Homeokinesis ----- //
+  // Settings that can be changed over ROS (parameters of the qutee_node) while the controller runs
+  // Defaults: tuned on the robot (on the floor) on 2026-10-10; the controller's own defaults are in homeokinesis.hpp
+  struct HkSettings {
+    float epsA = 0.5f, epsC = 0.5f;             // learning rates of the model (A) and controller (C)
+    float creativity = 0.1f, harmony = 0.1f, damping = 0.00001f, causeaware = 0.01f;
+    int steps4Delay = 10, steps4Averaging = 10;  // in control steps (50 Hz), 1..9
+    float amplitude = 0.8f;                      // motor targets = controller output * amplitude (1 = +-45 deg)
+    float motorSmoothing = 0.0f;                 // 0 off; s: each step the target moves (1 - s) of the way to the output
+    // White noise, uniform in [-n, n] (1 = 45 deg): homeokinesis amplifies fluctuations, and these servos are
+    // too precise to provide them. Added to each joint reading, and to each output before amplitude.
+    float sensorNoise = 0.05f;
+    float motorNoise = 0.05f;
+    // Servos: time (ms) to reach each new target (0 = as fast as possible; 20 = one control period, so the
+    // joints move continuously instead of jumping and stopping 50 times a second), and position P gain
+    int servoProfileMs = 20;
+    int servoPGain = 400;  // the XL330's own default; rollouts and poses use 1600 (set_PID_gains)
+  };
+  // Runs the controller until the user holds the Boot button (back to the menu). Blocks.
+  void run_homeokinesis();
+  bool homeokinesis_active() const {return _hk_active;}    // in homeokinesis mode (running or stopped)
+  bool homeokinesis_running() const {return _hk_running;}  // controller driving the motors
+  void hk_request_running(bool running){_hk_run_request = running ? 1 : 0;}
+  void hk_request_reset(){_hk_reset_request = true;}
+  HkSettings hk_settings(){std::lock_guard<std::mutex> lock(_hk_lock); return _hk_settings;}
+  void hk_set_settings(const HkSettings& s){std::lock_guard<std::mutex> lock(_hk_lock); _hk_settings = s; _hk_settings_changed = true;}
 private:
   void send_actions(const Actions_t& actions);
   void move_slowly(const Actions_t& target, int duration_ms);
   void set_torque(bool on);
+  void set_servo_motion(int profile_ms, int p_gain);
   Actions_t legs_raised_pose(float angle_deg);
   void get_motor_positions(State_t& state_ref, size_t offset);
   void get_state(State_t& state_ref);
   void check_motor_power();
   int reboot_faulted_motors(bool log_healthy);
+  int32_t read_hardware_error(int id);
   void init_motors();
   void set_PID_gains();
   void init_imu();
@@ -104,7 +145,10 @@ private:
   std::vector<std::string>  get_name_list();
   void select_name();
   bool wait_button_press();
-  void enter_ros_mode();
+  int poll_button();  // non-blocking: 0 nothing, 1 short press (on release), 2 long press (while held)
+  static void hk_task(void* robot);
+  void hk_loop();
+  void hk_screen();
   void name_memory(size_t * id, bool write);
   
   // ----- Attributes ---- //
@@ -153,7 +197,24 @@ private:
   float _last_positions[DXL_ID_CNT] = {};
   int _incomplete_reads = 0; // SyncReads in the current episode that didn't get all motors
   bool _torque_on = false;
+#ifdef CONFIG_TORQUE_OFF_AT_REST
+  std::atomic<bool> _torque_off_at_rest{true};
+#else
+  std::atomic<bool> _torque_off_at_rest{false};
+#endif
   std::string _motor_report;
+  std::recursive_mutex _tft_lock;  // the screen is used by the homeokinesis and ROS tasks
+
+  typedef im::hk::Homeokinesis<float, DXL_ID_CNT, DXL_ID_CNT> Homeokinesis_t;
+  Homeokinesis_t _hk;
+  std::mutex _hk_lock;  // guards _hk_settings, set from the ROS task
+  HkSettings _hk_settings;
+  std::atomic<bool> _hk_settings_changed{true};
+  std::atomic<bool> _hk_active{false}, _hk_running{false}, _hk_reset_request{false};
+  std::atomic<int> _hk_run_request{-1};  // -1 none, 0 stop, 1 start
+  SemaphoreHandle_t _hk_done = nullptr;  // given by the homeokinesis task when it ends
+  bool _btn_down = false, _btn_long = false;
+  int64_t _btn_start = 0;
   std::string name;
 };
 

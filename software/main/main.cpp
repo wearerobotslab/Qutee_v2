@@ -34,6 +34,10 @@
 #include "qutee_interface/srv/rollout.h"
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
+#include <rclc_parameter/rclc_parameter.h>
+#include <rcl_interfaces/msg/parameter_type.h>
+#include <atomic>
+#include <string.h>
 
 //#include <std_srvs/srv/set_bool.h>
 //#include "example_interfaces/srv/add_two_ints.h" // for tests with services
@@ -227,13 +231,27 @@ void create_response(qutee_interface__srv__Rollout_Response* response)
     return;
 }*/
 
+// Rollouts drive the motors, so they only run in ROS mode (not in the menu, checkup or homeokinesis)
+static std::atomic<bool> ros_mode{false};
+
 // Callback function for ROS subscriber
 void rollout_callback(const void * req, void * res)
 {
-    ESP_LOGI("ROS: ","Entered the Rollout callback");  
+    ESP_LOGI("ROS: ","Entered the Rollout callback");
     qutee_interface__srv__Rollout_Request * weights_msg = (qutee_interface__srv__Rollout_Request *) req;
-    qutee_interface__srv__Rollout_Response * transitions = (qutee_interface__srv__Rollout_Response *) res; 
-    
+    qutee_interface__srv__Rollout_Response * transitions = (qutee_interface__srv__Rollout_Response *) res;
+
+    if(!ros_mode){
+      const char* reason = robot.homeokinesis_active() ? "rollout refused: homeokinesis is running; "
+                                                       : "rollout refused: the robot is not in ROS mode; ";
+      ESP_LOGW("ROS: ", "%s", reason);
+      robot.set_motor_report(reason);
+      // Reply with zeros: the response buffers would otherwise hold the previous rollout
+      std::fill(transitions->states.data.data, transitions->states.data.data + transitions->states.data.size, 0.0f);
+      std::fill(transitions->actions.data.data, transitions->actions.data.data + transitions->actions.data.size, 0.0f);
+      return;
+    }
+
     ESP_LOGI("ROS: ","First Weight: %f last Weight: %f", *weights_msg->weights.data.data,*(weights_msg->weights.data.data+weights_msg->weights.data.size-1 )); 
     ESP_LOGI("ROS: ","INIT First Weight: %f last Weight: %f", *robot.get_policy().get_weights().data(),*(robot.get_policy().get_weights().data() + 321));
     // Copy weight to the robot's policy
@@ -320,6 +338,113 @@ void status_callback(const void * req, void * res){
 
 
 
+// ROS 2 parameters of the qutee_node: the homeokinesis settings, plus "running" (start/stop) and "reset".
+//   ros2 param set /<robot name>/qutee_node eps_A 0.05
+static rclc_parameter_server_t param_server;
+
+static bool on_parameter_changed(const Parameter* old_param, const Parameter* new_param, void* context)
+{
+  (void) old_param;
+  (void) context;
+  if(new_param == NULL)
+    return false; // parameters can't be deleted
+  const char* name = new_param->name.data;
+  const ParameterValue& value = new_param->value;
+
+  if(strcmp(name, "running") == 0){
+    if(value.bool_value && !robot.homeokinesis_active()){
+      ESP_LOGW("HK", "running: choose Homeokinesis in the robot's menu first");
+      return false;
+    }
+    robot.hk_request_running(value.bool_value);
+    return true;
+  }
+  if(strcmp(name, "reset") == 0){
+    if(value.bool_value)
+      robot.hk_request_reset();
+    return true;
+  }
+  if(strcmp(name, "torque_off_at_rest") == 0){
+    robot.set_torque_off_at_rest(value.bool_value);
+    return true;
+  }
+
+  Qutee::HkSettings s = robot.hk_settings();
+  if(new_param->value.type == rcl_interfaces__msg__ParameterType__PARAMETER_INTEGER){
+    struct { const char* name; int* field; int64_t min, max; } ints[] = {
+      {"steps_delay", &s.steps4Delay, 1, 9}, {"steps_averaging", &s.steps4Averaging, 1, 9},
+      {"servo_profile_ms", &s.servoProfileMs, 0, 1000}, {"servo_p_gain", &s.servoPGain, 0, 16383}};
+    bool found = false;
+    for(auto& p : ints){
+      if(strcmp(name, p.name) != 0)
+        continue;
+      found = true;
+      if(value.integer_value < p.min || value.integer_value > p.max){
+        ESP_LOGW("HK", "%s must be between %lld and %lld", name, p.min, p.max);
+        return false;
+      }
+      *p.field = (int) value.integer_value;
+    }
+    if(!found)
+      return false;
+  } else {
+    float v = (float) value.double_value;
+    bool noise = strcmp(name, "sensor_noise") == 0 || strcmp(name, "motor_noise") == 0;
+    if(v < 0 || (strcmp(name, "amplitude") == 0 && v > 1) || (strcmp(name, "motor_smoothing") == 0 && v > 0.99f)
+       || (noise && v > 1)){
+      ESP_LOGW("HK", "%s must be >= 0 (amplitude and noise: 0 to 1, motor_smoothing: 0 to 0.99)", name);
+      return false;
+    }
+    if(strcmp(name, "eps_A") == 0) s.epsA = v;
+    else if(strcmp(name, "eps_C") == 0) s.epsC = v;
+    else if(strcmp(name, "creativity") == 0) s.creativity = v;
+    else if(strcmp(name, "harmony") == 0) s.harmony = v;
+    else if(strcmp(name, "damping") == 0) s.damping = v;
+    else if(strcmp(name, "causeaware") == 0) s.causeaware = v;
+    else if(strcmp(name, "amplitude") == 0) s.amplitude = v;
+    else if(strcmp(name, "motor_smoothing") == 0) s.motorSmoothing = v;
+    else if(strcmp(name, "sensor_noise") == 0) s.sensorNoise = v;
+    else if(strcmp(name, "motor_noise") == 0) s.motorNoise = v;
+    else return false;
+  }
+  robot.hk_set_settings(s);
+  return true;
+}
+
+static void add_parameters()
+{
+  rclc_parameter_options_t options = {};
+  options.notify_changed_over_dds = false;
+  options.max_params = 20;
+  options.allow_undeclared_parameters = false;
+  options.low_mem_mode = false;
+  RCCHECK(rclc_parameter_server_init_with_option(&param_server, &node, &options));
+
+  Qutee::HkSettings s = robot.hk_settings();
+  const struct { const char* name; float value; } doubles[] = {
+    {"eps_A", s.epsA}, {"eps_C", s.epsC}, {"creativity", s.creativity}, {"harmony", s.harmony},
+    {"damping", s.damping}, {"causeaware", s.causeaware}, {"amplitude", s.amplitude},
+    {"motor_smoothing", s.motorSmoothing}, {"sensor_noise", s.sensorNoise}, {"motor_noise", s.motorNoise}};
+  for(const auto& d : doubles){
+    RCCHECK(rclc_add_parameter(&param_server, d.name, RCLC_PARAMETER_DOUBLE));
+    RCCHECK(rclc_parameter_set_double(&param_server, d.name, d.value));
+  }
+  RCCHECK(rclc_add_parameter(&param_server, "steps_delay", RCLC_PARAMETER_INT));
+  RCCHECK(rclc_parameter_set_int(&param_server, "steps_delay", s.steps4Delay));
+  RCCHECK(rclc_add_parameter(&param_server, "steps_averaging", RCLC_PARAMETER_INT));
+  RCCHECK(rclc_parameter_set_int(&param_server, "steps_averaging", s.steps4Averaging));
+  RCCHECK(rclc_add_parameter(&param_server, "servo_profile_ms", RCLC_PARAMETER_INT));
+  RCCHECK(rclc_parameter_set_int(&param_server, "servo_profile_ms", s.servoProfileMs));
+  RCCHECK(rclc_add_parameter(&param_server, "servo_p_gain", RCLC_PARAMETER_INT));
+  RCCHECK(rclc_parameter_set_int(&param_server, "servo_p_gain", s.servoPGain));
+  RCCHECK(rclc_add_parameter(&param_server, "running", RCLC_PARAMETER_BOOL));
+  RCCHECK(rclc_parameter_set_bool(&param_server, "running", false));
+  RCCHECK(rclc_add_parameter(&param_server, "reset", RCLC_PARAMETER_BOOL));
+  RCCHECK(rclc_parameter_set_bool(&param_server, "reset", false));
+  RCCHECK(rclc_add_parameter(&param_server, "torque_off_at_rest", RCLC_PARAMETER_BOOL));
+  RCCHECK(rclc_parameter_set_bool(&param_server, "torque_off_at_rest", robot.torque_off_at_rest()));
+}
+
 // Micro-ROS task function
 // this function init ros node, creates the subscribers and publishers and spins infinitely.
 void micro_ros_task(void * arg)
@@ -360,10 +485,15 @@ void micro_ros_task(void * arg)
 
 
     
-    // create executor
+    // Homeokinesis parameters (added to the executor below, once their initial values are set)
+    ESP_LOGI("UROS","Init parameter server");
+    add_parameters();
+
+    // create executor: the status and rollout services, and the parameter server's services
     rclc_executor_t executor;
-    unsigned int num_handles = 2; // we have two handles, one for each service
+    unsigned int num_handles = 2 + RCLC_EXECUTOR_PARAMETER_SERVER_HANDLES;
     RCCHECK(rclc_executor_init(&executor, &support.context, num_handles, &allocator));
+    RCCHECK(rclc_executor_add_parameter_server(&executor, &param_server, on_parameter_changed));
     
     // Create service for Status
     ESP_LOGI("UROS","Init status service");
@@ -419,9 +549,15 @@ void micro_ros_task(void * arg)
     // agent (e.g. Docker port forwarding) drops the UDP flow and service requests never arrive.
     const int64_t keepalive_period_us = 5000000;
     int64_t last_keepalive = esp_timer_get_time();
+    bool running_published = false;
     while(1){
       // Soft check: a reply that fails to send (e.g. too large) must not stop the ROS task
       RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1000)));
+      // Keep the "running" parameter in step with the robot (stopped or started with its button).
+      // Parameters are not thread-safe, so they are only changed from this task.
+      bool running = robot.homeokinesis_running();
+      if(running != running_published && rclc_parameter_set_bool(&param_server, "running", running) == RCL_RET_OK)
+        running_published = running;
       if(esp_timer_get_time() - last_keepalive > keepalive_period_us){
         if(rmw_uros_ping_agent(100, 1) != RMW_RET_OK){
           ESP_LOGW("UROS","No answer from the agent to the keepalive ping");
@@ -444,6 +580,8 @@ void micro_ros_task(void * arg)
 
 
 
+static void start_ros();
+
 // Entry point of the application
 extern "C" void app_main()
 {
@@ -451,8 +589,27 @@ extern "C" void app_main()
 
     // Initialize robot and perform calibration
     robot.init();
-    robot.menu();
-    // if the user selects "launch ros" in the menu, the menu returns here. 
+    while(true){
+      Qutee::MenuChoice choice = robot.menu();
+      if(choice == Qutee::MenuChoice::Ros){
+        robot.enter_ros_mode();
+        start_ros();
+        ros_mode = true; // stays in ROS mode until reset
+        return;
+      }
+      // Homeokinesis: ROS (if reachable) lets its parameters be changed; holding the button returns here
+      start_ros();
+      robot.run_homeokinesis();
+    }
+}
+
+// Connect WiFi and start the micro-ROS task, the first time only (the connection stays up afterwards)
+static void start_ros()
+{
+    static bool started = false;
+    if(started)
+      return;
+    started = true;
 
     // Initialize network interface if needed
     #if defined(CONFIG_MICRO_ROS_ESP_NETIF_WLAN) || defined(CONFIG_MICRO_ROS_ESP_NETIF_ENET)
@@ -478,15 +635,5 @@ extern "C" void app_main()
             CONFIG_MICRO_ROS_APP_STACK,
             NULL,
             CONFIG_MICRO_ROS_APP_TASK_PRIO,
-            NULL); 
-
-    //pin micro-ros task in APP_CPU to make PRO_CPU to deal with wifi:
-    /*xTaskCreate(robot_control_task,
-            "uros_task",
-            CONFIG_ROBOT_CTRL_APP_STACK,
-            NULL,
-            CONFIG_ROBOT_CTRL_APP_TASK_PRIO,
-            NULL);  
-
-    */
+            NULL);
 }
