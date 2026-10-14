@@ -530,6 +530,10 @@ void Qutee::init_motors()
     int32_t drive_mode = this->_dxl.readControlTableItem(DRIVE_MODE, DXL_IDs[i]);
     if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && !(drive_mode & 0x04))
       this->_dxl.writeControlTableItem(DRIVE_MODE, DXL_IDs[i], drive_mode | 0x04);
+    // Full output (homeokinesis may lower it; it stays in EEPROM if the robot was switched off meanwhile)
+    int32_t pwm_limit = this->_dxl.readControlTableItem(PWM_LIMIT, DXL_IDs[i]);
+    if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && pwm_limit != 885)
+      this->_dxl.writeControlTableItem(PWM_LIMIT, DXL_IDs[i], 885);
     this->_dxl.torqueOn(this->DXL_IDs[i]);
     ESP_LOGI("DXL: ","TORQUE ON" );
     // No motion profile (0): the motor reaches each target as fast as it can
@@ -603,6 +607,40 @@ void Qutee::set_servo_motion(int profile_ms, int p_gain)
     this->_dxl.writeControlTableItem(POSITION_P_GAIN, DXL_IDs[i], p_gain);
   }
   ESP_LOGI("DXL: ", "Servo profile %d ms, P gain %d", profile_ms, p_gain);
+}
+
+// PWM Limit is an EEPROM item: the caller must have turned the torque off. Only motors whose value
+// differs are written, to spare their EEPROM.
+void Qutee::set_pwm_limit(int limit)
+{
+  for(size_t i = 0; i < DXL_ID_CNT; i++){
+    int32_t current = this->_dxl.readControlTableItem(PWM_LIMIT, DXL_IDs[i]);
+    if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && current != limit)
+      this->_dxl.writeControlTableItem(PWM_LIMIT, DXL_IDs[i], limit);
+  }
+  ESP_LOGI("DXL: ", "PWM limit %d (%.0f%%)", limit, limit / 8.85f);
+}
+
+// Bring back one motor after a fault (e.g. overload) while the others keep running: reboot it, let it cool
+// down, and set it up again without a jump (goal = where the joint is now). PWM Limit survives a reboot.
+void Qutee::recover_motor(int id, int profile_ms, int p_gain)
+{
+  this->_dxl.reboot(id);
+  delay(2000);
+  this->_dxl.torqueOff(id);
+  this->_dxl.setOperatingMode(id, OP_POSITION);
+  int32_t drive_mode = this->_dxl.readControlTableItem(DRIVE_MODE, id);
+  if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && !(drive_mode & 0x04))
+    this->_dxl.writeControlTableItem(DRIVE_MODE, id, drive_mode | 0x04);
+  int32_t position = this->_dxl.readControlTableItem(PRESENT_POSITION, id);
+  if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK)
+    this->_dxl.writeControlTableItem(GOAL_POSITION, id, position);
+  this->_dxl.torqueOn(id);
+  this->_dxl.writeControlTableItem(PROFILE_VELOCITY, id, profile_ms);
+  this->_dxl.writeControlTableItem(PROFILE_ACCELERATION, id, profile_ms / 4);
+  this->_dxl.writeControlTableItem(POSITION_P_GAIN, id, p_gain);
+  this->_dxl.writeControlTableItem(POSITION_I_GAIN, id, 0);
+  this->_dxl.writeControlTableItem(POSITION_D_GAIN, id, 40);
 }
 
 void Qutee::go_to_rest_pose()
@@ -1114,23 +1152,43 @@ void Qutee::hk_loop(){
   this->_hk.reset();
   this->_hk_active = true;
 
-  this->_motor_report.clear();
-  if(this->reboot_faulted_motors(false) > 0)
-    this->init_motors();
-  this->go_to_standing_pose();
-  this->_hk_running = true;
-  this->hk_screen();
-  ESP_LOGI("HK", "Homeokinesis started");
-
   State_t state;
   Homeokinesis_t::SensorVec x;
   Homeokinesis_t::MotorVec target = Homeokinesis_t::MotorVec::Zero(); // smoothed motor targets (0 = standing)
   Actions_t actions;
   float amplitude = 0, smoothing = 0, sensor_noise = 0, motor_noise = 0;
+  bool auto_recover = true;
   // Uniform white noise in [-n, n], from the hardware random number generator
   auto noise = [](float n) { return n == 0.0f ? 0.0f : (esp_random() * (2.0f / 4294967295.0f) - 1.0f) * n; };
-  int servo_profile_ms = 0, servo_p_gain = 1600; // as set by init_motors and set_PID_gains
+  // Servo settings as last written to the motors (init_motors sets profile 0, P gain 1600, PWM limit 885)
+  int servo_profile_ms = 0, servo_p_gain = 1600, pwm_limit = 885;
+  auto motors_initialised = [&]() {
+    servo_profile_ms = 0;
+    servo_p_gain = 1600;
+    pwm_limit = 885;
+    this->_hk_settings_changed = true; // write homeokinesis' servo settings again
+  };
+  // PWM Limit is an EEPROM item: only at rest, with the torque off (the torso is on the ground)
+  auto apply_pwm_limit = [&](int limit) {
+    if(limit == pwm_limit)
+      return;
+    this->set_torque(false);
+    this->set_pwm_limit(limit);
+    pwm_limit = limit;
+  };
+  int64_t trips[DXL_ID_CNT][3] = {}; // times of each motor's last 3 overloads, for auto-recovery
   size_t fault_check = 0; // motor whose hardware error status is read this step (one per step)
+
+  this->_motor_report.clear();
+  if(this->reboot_faulted_motors(false) > 0){
+    this->init_motors();
+    motors_initialised();
+  }
+  apply_pwm_limit(this->hk_settings().servoPwmLimit);
+  this->go_to_standing_pose();
+  this->_hk_running = true;
+  this->hk_screen();
+  ESP_LOGI("HK", "Homeokinesis started");
   int64_t step_us_sum = 0, step_us_max = 0;
   int steps_in_log = 0;
   this->_incomplete_reads = 0;
@@ -1145,8 +1203,11 @@ void Qutee::hk_loop(){
       request = this->_hk_running ? 0 : 1;
     if(request != -1 && (request == 1) != this->_hk_running){
       if(request == 1){
-        if(this->reboot_faulted_motors(false) > 0)
+        if(this->reboot_faulted_motors(false) > 0){
           this->init_motors();
+          motors_initialised();
+        }
+        apply_pwm_limit(this->hk_settings().servoPwmLimit);
         this->go_to_standing_pose();
       } else {
         this->go_to_rest_pose();
@@ -1171,6 +1232,18 @@ void Qutee::hk_loop(){
       smoothing = s.motorSmoothing;
       sensor_noise = s.sensorNoise;
       motor_noise = s.motorNoise;
+      auto_recover = s.autoRecover;
+      if(s.servoPwmLimit != pwm_limit){
+        // Pause: to rest, change the limit with the torque off, and stand up again if it was running
+        ESP_LOGI("HK", "Changing the PWM limit to %d: going to rest", s.servoPwmLimit);
+        if(this->_hk_running)
+          this->go_to_rest_pose();
+        apply_pwm_limit(s.servoPwmLimit);
+        if(this->_hk_running)
+          this->go_to_standing_pose();
+        target.setZero();
+        next = esp_timer_get_time();
+      }
       if(s.servoProfileMs != servo_profile_ms || s.servoPGain != servo_p_gain){
         servo_profile_ms = s.servoProfileMs;
         servo_p_gain = s.servoPGain;
@@ -1200,11 +1273,28 @@ void Qutee::hk_loop(){
 
       // A motor that trips (e.g. overload) goes limp: stop rather than carry on with a dead joint.
       // A garbled reply can look like an error, so stop only on a valid value read twice.
-      int id = DXL_IDs[fault_check];
+      size_t index = fault_check;
+      int id = DXL_IDs[index];
       fault_check = (fault_check + 1) % DXL_ID_CNT;
       int32_t error = this->read_hardware_error(id);
       if(error > 0)
         error = (this->read_hardware_error(id) == error) ? error : 0;
+      if(error == 0x20 && auto_recover){
+        // Overload only: bring the motor back unless it keeps tripping (3 times in a minute)
+        int64_t now = esp_timer_get_time();
+        trips[index][2] = trips[index][1];
+        trips[index][1] = trips[index][0];
+        trips[index][0] = now;
+        bool too_often = trips[index][2] != 0 && now - trips[index][2] < 60000000;
+        if(!too_often){
+          ESP_LOGW("HK", "Motor %d overload: rebooting it and continuing", id);
+          this->_motor_report += "motor " + std::to_string(id) + " overload (recovered); ";
+          this->recover_motor(id, servo_profile_ms, servo_p_gain);
+          next = esp_timer_get_time();
+          continue;
+        }
+        ESP_LOGW("HK", "Motor %d overloaded 3 times in a minute", id);
+      }
       if(error > 0){
         ESP_LOGW("HK", "Motor %d hardware error 0x%02lx%s: stopping", id, (long) error, (error & 0x20) ? " (overload)" : "");
         this->_motor_report += "homeokinesis stopped: motor " + std::to_string(id) + " hardware error; ";
@@ -1241,6 +1331,7 @@ void Qutee::hk_loop(){
 
   if(this->_hk_running)
     this->go_to_rest_pose();
+  apply_pwm_limit(885); // full output again (at rest)
   if(servo_profile_ms != 0 || servo_p_gain != 1600)
     this->set_servo_motion(0, 1600); // back to what rollouts and the checkup expect
   this->_hk_running = false;

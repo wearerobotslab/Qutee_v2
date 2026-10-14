@@ -380,6 +380,8 @@ ros2 param load /qutee/qutee_node /params/good.yaml          # restore it (the r
 | `sensor_noise`, `motor_noise` | 0.05, 0.05 | Uniform white noise in [-n, n] (1 = 45°) added to each joint reading and to each output. Homeokinesis amplifies fluctuations; the servos are too precise to provide them, so without noise the robot may need a push to start. |
 | `servo_p_gain` | 400 | Servo stiffness while homeokinesis runs (rollouts and poses use 1600). Softer means fewer overloads. |
 | `servo_profile_ms` | 20 | Time each servo takes to reach a new target (0 = as fast as possible): smoother movement and lower current peaks. |
+| `servo_pwm_limit` | 700 | Maximum output of each motor (0 to 885 = 100%), to make overloads rarer. Set at rest with the torque off, so it also applies while standing up; changing it while running pauses homeokinesis (rest, change, stand up). Back to 885 when homeokinesis ends and at boot. |
+| `auto_recover` | true | On an overload, reboot only that motor, let it cool down 2 s and continue. A motor that overloads 3 times within a minute, or any other fault, stops homeokinesis. |
 | `motor_smoothing` | 0 | Filters the targets (0 to 0.99). |
 | `creativity`, `harmony`, `damping`, `causeaware` | 0.1, 0.1, 1e-5, 0.01 | Further Sox parameters. |
 | `steps_delay`, `steps_averaging` | 10 (used as 9) | Delay between a command and its effect, and sensor smoothing, in steps (1 to 9). |

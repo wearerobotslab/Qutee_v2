@@ -108,6 +108,11 @@ public:
     // joints move continuously instead of jumping and stopping 50 times a second), and position P gain
     int servoProfileMs = 20;
     int servoPGain = 400;  // the XL330's own default; rollouts and poses use 1600 (set_PID_gains)
+    // Maximum output of each motor (PWM Limit, 0..885 = 0..100%): limits the load that leads to overloads.
+    // An EEPROM item, so it is changed at rest with the torque off; it also applies while standing up.
+    int servoPwmLimit = 700;  // about 79%; motors otherwise run at 885 (100%)
+    // On an overload, reboot only that motor, let it cool down 2 s and continue (3 trips in a minute: stop)
+    bool autoRecover = true;
   };
   // Runs the controller until the user holds the Boot button (back to the menu). Blocks.
   void run_homeokinesis();
@@ -122,6 +127,8 @@ private:
   void move_slowly(const Actions_t& target, int duration_ms);
   void set_torque(bool on);
   void set_servo_motion(int profile_ms, int p_gain);
+  void set_pwm_limit(int limit);
+  void recover_motor(int id, int profile_ms, int p_gain);
   Actions_t legs_raised_pose(float angle_deg);
   void get_motor_positions(State_t& state_ref, size_t offset);
   void get_state(State_t& state_ref);

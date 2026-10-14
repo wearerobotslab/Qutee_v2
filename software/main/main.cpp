@@ -368,12 +368,19 @@ static bool on_parameter_changed(const Parameter* old_param, const Parameter* ne
     robot.set_torque_off_at_rest(value.bool_value);
     return true;
   }
+  if(strcmp(name, "auto_recover") == 0){
+    Qutee::HkSettings s = robot.hk_settings();
+    s.autoRecover = value.bool_value;
+    robot.hk_set_settings(s);
+    return true;
+  }
 
   Qutee::HkSettings s = robot.hk_settings();
   if(new_param->value.type == rcl_interfaces__msg__ParameterType__PARAMETER_INTEGER){
     struct { const char* name; int* field; int64_t min, max; } ints[] = {
       {"steps_delay", &s.steps4Delay, 1, 9}, {"steps_averaging", &s.steps4Averaging, 1, 9},
-      {"servo_profile_ms", &s.servoProfileMs, 0, 1000}, {"servo_p_gain", &s.servoPGain, 0, 16383}};
+      {"servo_profile_ms", &s.servoProfileMs, 0, 1000}, {"servo_p_gain", &s.servoPGain, 0, 16383},
+      {"servo_pwm_limit", &s.servoPwmLimit, 0, 885}};
     bool found = false;
     for(auto& p : ints){
       if(strcmp(name, p.name) != 0)
@@ -437,6 +444,10 @@ static void add_parameters()
   RCCHECK(rclc_parameter_set_int(&param_server, "servo_profile_ms", s.servoProfileMs));
   RCCHECK(rclc_add_parameter(&param_server, "servo_p_gain", RCLC_PARAMETER_INT));
   RCCHECK(rclc_parameter_set_int(&param_server, "servo_p_gain", s.servoPGain));
+  RCCHECK(rclc_add_parameter(&param_server, "servo_pwm_limit", RCLC_PARAMETER_INT));
+  RCCHECK(rclc_parameter_set_int(&param_server, "servo_pwm_limit", s.servoPwmLimit));
+  RCCHECK(rclc_add_parameter(&param_server, "auto_recover", RCLC_PARAMETER_BOOL));
+  RCCHECK(rclc_parameter_set_bool(&param_server, "auto_recover", s.autoRecover));
   RCCHECK(rclc_add_parameter(&param_server, "running", RCLC_PARAMETER_BOOL));
   RCCHECK(rclc_parameter_set_bool(&param_server, "running", false));
   RCCHECK(rclc_add_parameter(&param_server, "reset", RCLC_PARAMETER_BOOL));
