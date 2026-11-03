@@ -4,7 +4,8 @@ This guide covers building the firmware, flashing it, watching the robot's logs 
 
 > **Status: work in progress.**
 > - **Tested on Windows 11:** building the firmware, flashing and monitoring, boot, screen and menu, battery monitor, the motors and the checkup, the connection to the micro-ROS agent, and the `status` and `rollout` services.
-> - **Built but not tested on the robot yet:** the firmware split into applications (neural network, homeokinesis), with ROS started at boot (branch `qutier_split`).
+> - **Tested on the robot:** the firmware split into applications, with ROS started at boot: the base robot, `joint_states`, and `nn` rollouts.
+> - **Built but not confirmed on the robot yet:** homeokinesis with normalised joints and its GUI, and the joint reader.
 > - **Not tested yet:** the whole Linux section, and the IMU (our robot has none fitted).
 
 ## Contents
