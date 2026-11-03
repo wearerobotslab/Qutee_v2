@@ -17,16 +17,17 @@ Then, launch and shell into the qutee_idf container:
 docker run -it --rm --user espidf --volume="/etc/timezone:/etc/timezone:ro" -v $(pwd):/micro_ros_espidf_component -v /dev:/dev --privileged --workdir /micro_ros_espidf_component qutee_idf /bin/bash
 ```
 
-To build the Qutee's firmware now that you are inside the container:
+The firmware is the robot (`main/`) plus one application from `apps/` (`nn`, `homeokinesis` or `joint_reader`, see USING_THE_ROBOT.md). To build one now that you are inside the container, for example the neural network controller:
 ```
-idf.py build
+idf.py -B build/nn -DQUTEE_APP=nn build
 ```
+Each application has its own build folder and binary (`build/nn/qutee_nn.bin`). From the host, `./build.sh nn` does the same in the container.
 
 Successful builds will show at the end: `Successfully created esp32s3 image.`
 
 ## Configure the Qutee firmware:
 
-Still inside the container, do 'idf.py menuconfig' to open the configuration menu.
+Still inside the container, do 'idf.py -B build/nn -DQUTEE_APP=nn menuconfig' to open the configuration menu.
 You can for instance, change the name of your Qutee in `QUTEE settings -> Name of the Qutee robot`
 You can also change the wifi credentials in `micro-ROS Settings -> WiFi Configuration`
 
@@ -35,7 +36,7 @@ Don't forget to rebuild the firmware after any change in the configuration.
 ## To flash:
 To flash your robot: 
 ```
-python $IDF_PATH/components/esptool_py/esptool/esptool.py -p (PORT) -b 460800 --before default_reset --after hard_reset --chip esp32s3  write_flash --flash_mode dio --flash_size 2MB --flash_freq 40m 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/QuteeV2.bin
+python $IDF_PATH/components/esptool_py/esptool/esptool.py -p (PORT) -b 460800 --before default_reset --after hard_reset --chip esp32s3  write_flash --flash_mode dio --flash_size 4MB --flash_freq 40m 0x0 build/nn/bootloader/bootloader.bin 0x8000 build/nn/partition_table/partition-table.bin 0x10000 build/nn/qutee_nn.bin
 ```
 You have to replace **(PORT)** with the port you want to use, such as `/dev/cu.usbmodem1201`
 
@@ -44,7 +45,7 @@ First install the esptool: `pip install esptool`
 
 Then you can flash using a similar command as above: 
 ```
-python -m esptool -p (PORT) -b 460800 --before default_reset --after hard_reset --chip esp32s3  write_flash --flash_mode dio --flash_size 2MB --flash_freq 40m 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/QuteeV2.bin
+python -m esptool -p (PORT) -b 460800 --before default_reset --after hard_reset --chip esp32s3  write_flash --flash_mode dio --flash_size 4MB --flash_freq 40m 0x0 build/nn/bootloader/bootloader.bin 0x8000 build/nn/partition_table/partition-table.bin 0x10000 build/nn/qutee_nn.bin
 ```
 
 

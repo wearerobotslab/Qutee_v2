@@ -1,6 +1,6 @@
 """Show the Qutee's logs over WiFi, like serial_monitor.py does over USB.
 
-In ROS mode, once WiFi is connected, the robot sends its logs (starting with the ones since boot)
+Once WiFi is connected (at boot), the robot sends its logs (starting with the ones since boot)
 by UDP to the micro-ROS agent's IP, on port 8889 by default (menuconfig: QUTEE settings).
 Run this on the computer with that IP. The robot never sends lines containing "password".
 
@@ -37,7 +37,7 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("0.0.0.0", port))
 sock.settimeout(0.1)
 print(f"--- Listening for Qutee logs on UDP port {port}. Quit with Ctrl+C, Ctrl+X or q ---", flush=True)
-print("--- The robot starts sending when it connects to WiFi (Start ROS) ---", flush=True)
+print("--- The robot starts sending when it connects to WiFi, at boot ---", flush=True)
 
 sender = None
 try:

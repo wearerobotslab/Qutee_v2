@@ -6,9 +6,8 @@ A small firmware and GUI to **read the robot's 12 joint positions while you move
 |---|---|
 | `JointReader.hpp`, `JointReader.cpp` | Minimal version of `Qutee`: screen and motors only |
 | `joint_reader_main.cpp` | Entry point: motors with the torque off, WiFi, ROS (publisher and parameter) |
-| `select_app.sh` | Chooses which firmware the next build makes |
 | `joint_reader_gui.py` | PC window: angles, min/max, torque on/off, save ranges |
-| `rosbridge.Dockerfile` | rosbridge for the GUI |
+| `../../tools/rosbridge.Dockerfile`, `../../tools/qutee_docker.py` | rosbridge for the GUI, and starting it and the agent (shared with the homeokinesis GUI) |
 
 ## On the robot
 
@@ -25,15 +24,13 @@ The joint reader uses a different micro-ROS client key from the full firmware, s
 
 ## Build and flash
 
-The joint reader is built from the same project as the full firmware, chosen in menuconfig (**QUTEE settings → Application**) or with the script. From `software/`, in WSL or Linux:
+The joint reader is one of the applications of the firmware project. From `software/`, in WSL or Linux:
 
 ```bash
-joint_reader/select_app.sh joint_reader        # or: joint_reader/select_app.sh qutee  (back to the full firmware)
-docker run --rm --user espidf -v "$(pwd)":/micro_ros_espidf_component -w /micro_ros_espidf_component qutee_idf \
-  bash -lc '. $IDF_PATH/export.sh && idf.py reconfigure build'
+./build.sh joint_reader        # -> build/joint_reader/qutee_joint_reader.bin
 ```
 
-Flash as usual (`--flash-size 4MB`, see USING_THE_ROBOT.md). `sdkconfig` is not committed, so the choice is per machine; the default is the full firmware.
+Flash as usual (`--flash-size 4MB`, see USING_THE_ROBOT.md), from `build\joint_reader`. Unlike the other applications, it doesn't use the `Qutee` class yet: it has its own small robot class.
 
 ## On the PC
 

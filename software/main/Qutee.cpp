@@ -1,6 +1,20 @@
 #include "Qutee.hpp"
 #include <inttypes.h>
+#include <string.h>
+#include <thread>
 #include "driver/ledc.h"
+#include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include <uros_network_interfaces.h>
+#include <rmw_microros/rmw_microros.h>
+#include "qutee_interface/srv/status.h"
+#include <sensor_msgs/msg/joint_state.h>
+#include "udp_log.hpp"
 
 #define LEDC_TIMER              LEDC_TIMER_0
 #define LEDC_MODE               LEDC_LOW_SPEED_MODE
@@ -9,7 +23,10 @@
 #define LEDC_FREQUENCY          (4000) // Frequency in Hertz. Set frequency at 4 kHz
 #define TFT_BRIGHTNESS          0.5 // backlight duty cycle, from 0 (off) to 1 (full)
 
-
+// Screen rows (240 x 135 pixels): the menu at the top, then the ROS line and the status line (text size 1)
+#define ROS_ROW    112
+#define STATUS_ROW 124
+#define MENU_HEIGHT 108
 
 // Buttons: the Reverse TFT Feather has D0 (active low), D1 and D2 (active high).
 // The regular ESP32-S3 TFT Feather only has D0 (Boot), so its menus use short presses (next) and long presses (select).
@@ -20,15 +37,35 @@
 #endif
 #define LONG_PRESS_US 700000
 
-#define VALUE(string) #string
-#define TO_LITERAL(string) VALUE(string)
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ESP_LOGE("UROS","Failed status on line %d: %d. Aborting.",__LINE__,(int)temp_rc);vTaskDelete(NULL);}}
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ESP_LOGW("UROS","Failed status on line %d: %d. Continuing.",__LINE__,(int)temp_rc);}}
 
 const int Qutee::DXL_IDs[] = {11, 12, 13, 21, 22, 23,  31, 32, 33, 41, 42, 43};
+Qutee* Qutee::_instance = nullptr;
+
+Qutee::Qutee(const char* app_name, uint32_t ros_client_key_salt):
+  _tft(TFT_CS, TFT_DC, TFT_RST),
+  _app_name(app_name),
+  _ros_client_key_salt(ros_client_key_salt),
+  _dxl_port(UART_NUM_1),
+  _bno(55, 0x28)
+{
+  _instance = this;
+}
+
+// ----- Start-up ----- //
+
+void Qutee::run(){
+  udp_log_init(); // keep the logs from now on, to send them over WiFi once it is connected
+  this->init();
+  this->start_wifi();
+  // The ROS task retries until the agent answers, so the robot is usable (menu, checkup) without it
+  xTaskCreate(ros_task, "uros_task", CONFIG_MICRO_ROS_APP_STACK, this, CONFIG_MICRO_ROS_APP_TASK_PRIO, NULL);
+  this->start();
+  this->menu_loop();
+}
 
 void Qutee::init(){
-  
-  //Wire.setPins(GPIO_NUM_3,GPIO_NUM_4);
-  //Wire.begin();
   init_tft();
 
   size_t name_id = 0; // first name in the list until one is selected in the menu (the NVS read fails on a new robot)
@@ -38,21 +75,16 @@ void Qutee::init(){
     this->name = names[name_id];
   else
     this->name = "No-Name";
-    
-      
-  
-
-  
 
   tft_load_screen();
   _dxl.setPort(_dxl_port);
   int32_t baud = 3000000;
-  int8_t  protocol = 2;       
+  int8_t  protocol = 2;
   _dxl.setPortProtocolVersion((float) protocol);
   ESP_LOGI("DXL: ","PROTOCOL %i", protocol);
   ESP_LOGI("DXL: ","BAUDRATE %ld", baud);
   _dxl.begin(baud);
-  
+
   // Fill the members of structure to syncRead using external user packet buffer
   _sr_infos.packet.p_buf = _user_pkt_buf;
   _sr_infos.packet.buf_capacity = _user_pkt_buf_cap;
@@ -60,15 +92,15 @@ void Qutee::init(){
   _sr_infos.addr = SR_START_ADDR;
   _sr_infos.addr_length = SR_ADDR_LEN;
   _sr_infos.p_xels = _info_xels_sr;
-  _sr_infos.xel_count = 0;  
-  
-  for(int i = 0; i < DXL_ID_CNT; i++){
+  _sr_infos.xel_count = 0;
+
+  for(int i = 0; i < NB_MOTORS; i++){
     _info_xels_sr[i].id = DXL_IDs[i];
     _info_xels_sr[i].p_recv_buf = (uint8_t*)&_sr_data[i];
     _sr_infos.xel_count++;
   }
   _sr_infos.is_info_changed = true;
-  
+
   // Fill the members of structure to syncWrite using internal packet buffer
   _sw_infos.packet.p_buf = nullptr;
   _sw_infos.packet.is_completed = false;
@@ -76,14 +108,14 @@ void Qutee::init(){
   _sw_infos.addr_length = SW_ADDR_LEN;
   _sw_infos.p_xels = _info_xels_sw;
   _sw_infos.xel_count = 0;
-  
-  for(int i = 0; i < DXL_ID_CNT; i++){
+
+  for(int i = 0; i < NB_MOTORS; i++){
     _info_xels_sw[i].id = DXL_IDs[i];
     _info_xels_sw[i].p_data = (uint8_t*)&_sw_data[i].goal_position;
     _sw_infos.xel_count++;
   }
   _sw_infos.is_info_changed = true;
-  
+
   init_imu();
 
   // init battery monitor
@@ -102,8 +134,8 @@ void Qutee::init(){
   this->tft_status("Setting up motors...");
   init_motors();
   scan();
-  tft_init_data_screen();
   // Settle slowly: raise the legs so the torso rests on the ground, then lower them to the rest pose
+  this->tft_status("Moving to the rest pose...");
   move_slowly(legs_raised_pose(CONFIG_LEG_UP_ANGLE), CONFIG_POSE_TRANSITION_TIME_MS);
   go_to_rest_pose();
 }
@@ -143,15 +175,15 @@ void Qutee::init_imu(){
   this->load_imu_calibration();
   this->_bno.setMode(OPERATION_MODE_IMUPLUS);
   displaySensorStatus();
+  if(!this->_bno.isFullyCalibrated())
+    ESP_LOGW("IMU","The IMU is not calibrated: choose Calibrate IMU in the menu");
   ESP_LOGI("IMU","IMU DONE.");
-    
+
 }
 
 void Qutee::init_tft(){
-  // turn on backlite 
   gpio_set_direction((gpio_num_t)TFT_BACKLITE, GPIO_MODE_OUTPUT);
-  //gpio_set_level((gpio_num_t)TFT_BACKLITE, 1);
-  // Prepare and then apply the LEDC PWM timer configuration
+  // Prepare and then apply the LEDC PWM timer configuration (backlight brightness)
   ledc_timer_config_t ledc_timer;
   ledc_timer.speed_mode       = LEDC_MODE;
   ledc_timer.duty_resolution  = LEDC_DUTY_RES;
@@ -159,7 +191,7 @@ void Qutee::init_tft(){
   ledc_timer.freq_hz          = LEDC_FREQUENCY;  // Set output frequency at 4 kHz
   ledc_timer.clk_cfg          = LEDC_AUTO_CLK;
   ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-  
+
   // Prepare and then apply the LEDC PWM channel configuration
   ledc_channel_config_t ledc_channel;
   ledc_channel.speed_mode     = LEDC_MODE;
@@ -174,106 +206,59 @@ void Qutee::init_tft(){
   // turn on the TFT / I2C power supply
   gpio_set_direction((gpio_num_t)TFT_I2C_POWER, GPIO_MODE_OUTPUT);
   gpio_set_level((gpio_num_t)TFT_I2C_POWER, 1);
-  
+
   delay(10);
   this->_tft.init(135, 240);
   this->_tft.setRotation(3);
-
-}
-
-void Qutee::set_tft_brightness(size_t value) // value between 0 and 8192
-{
-  if (value>8192)
-    value = 8192;
-  // Set duty to new value%
-  ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, value));
-  // Update duty to apply the new value
-  ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+  gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
+#if QUTEE_THREE_BUTTONS
+  gpio_set_direction(GPIO_NUM_1, GPIO_MODE_INPUT);
+  gpio_set_direction(GPIO_NUM_2, GPIO_MODE_INPUT);
+#endif
 }
 
 void Qutee::tft_load_screen() {
+  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
   this->_tft.setTextWrap(false);
   this->_tft.fillScreen(ST77XX_BLACK);
-  this->_tft.setCursor(0, 30);
+  this->_tft.setCursor(0, 20);
   this->_tft.setTextColor(ST77XX_GREEN);
   this->_tft.setTextSize(2);
   this->_tft.println("Hi! My name is");
   this->_tft.println(this->name.c_str());
+  this->_tft.setTextColor(ST77XX_YELLOW);
+  this->_tft.println(this->_app_name);
   this->_tft.setTextColor(ST77XX_RED);
   this->_tft.println("Loading!");
   this->tft_status("Powered on");
   delay(1000);
 }
 
-// Show a one-line status message at the bottom of the screen (below the data screen's last row)
+static void tft_line(Adafruit_ST7789& tft, int row, const char* msg, uint16_t color) {
+  tft.fillRect(0, row, 240, 8, ST77XX_BLACK);
+  tft.setTextWrap(false);
+  tft.setTextSize(1);
+  tft.setTextColor(color, ST77XX_BLACK);
+  tft.setCursor(0, row);
+  tft.print(msg);
+}
+
 void Qutee::tft_status(const char* msg, uint16_t color) {
   std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
-  this->_tft.fillRect(0, 128, 240, 8, ST77XX_BLACK);
-  this->_tft.setTextWrap(false);
-  this->_tft.setTextSize(1);
-  this->_tft.setTextColor(color, ST77XX_BLACK);
-  this->_tft.setCursor(0, 128);
-  this->_tft.print(msg);
+  tft_line(this->_tft, STATUS_ROW, msg, color);
 }
 
-void Qutee::tft_init_data_screen() {
-  int lo = 10; // line offset
-  int io = 32; // item offset
-  this->_tft.fillScreen(ST77XX_BLACK);
-  this->_tft.setCursor(0, 0);
-  this->_tft.setTextColor(ST77XX_GREEN,ST77XX_BLACK);
-  this->_tft.setTextSize(1);
-  this->_tft.setCursor(160, 0);   this->_tft.setTextColor(ST77XX_WHITE,ST77XX_BLACK);   this->_tft.print("  Freq: ");
-  this->_tft.setCursor(0, 0);    this->_tft.setTextColor(ST77XX_RED,ST77XX_BLACK);    this->_tft.println("State: ");
-
-  this->_tft.setTextColor(ST77XX_BLUE,ST77XX_BLACK); 
-  this->_tft.setCursor(0*io, 1*lo); this->_tft.print("ox: ");  this->_tft.setCursor(2*io, 1*lo);  this->_tft.print(" oy: "); this->_tft.setCursor(4*io, 1*lo);  this->_tft.print(" oz: "); 
-  this->_tft.setCursor(0*io, 2*lo); this->_tft.print("ax: ");  this->_tft.setCursor(2*io, 2*lo);  this->_tft.print(" ay: "); this->_tft.setCursor(4*io, 2*lo);  this->_tft.print(" az: "); 
-  this->_tft.setCursor(0*io, 3*lo); this->_tft.print("11: ");  this->_tft.setCursor(2*io, 3*lo);  this->_tft.print(" 12: "); this->_tft.setCursor(4*io, 3*lo);  this->_tft.print(" 13: "); 
-  this->_tft.setCursor(0*io, 4*lo); this->_tft.print("21: ");  this->_tft.setCursor(2*io, 4*lo);  this->_tft.print(" 22: "); this->_tft.setCursor(4*io, 4*lo);  this->_tft.print(" 23: "); 
-  this->_tft.setCursor(0*io, 5*lo); this->_tft.print("31: ");  this->_tft.setCursor(2*io, 5*lo);  this->_tft.print(" 32: "); this->_tft.setCursor(4*io, 5*lo);  this->_tft.print(" 33: "); 
-  this->_tft.setCursor(0*io, 6*lo); this->_tft.print("41: ");  this->_tft.setCursor(2*io, 6*lo);  this->_tft.print(" 42: "); this->_tft.setCursor(4*io, 6*lo);  this->_tft.print(" 43: "); 
-
-  this->_tft.setCursor( 0, 8*lo); this->_tft.setTextColor(ST77XX_RED,ST77XX_BLACK); this->_tft.println("Actions: ");
-
-  this->_tft.setTextColor(ST77XX_BLUE,ST77XX_BLACK); 
-  this->_tft.setCursor(0*io, 9*lo);  this->_tft.print("11: ");  this->_tft.setCursor(2*io, 9*lo);   this->_tft.print(" 12: "); this->_tft.setCursor(4*io, 9*lo);   this->_tft.print(" 13: "); 
-  this->_tft.setCursor(0*io, 10*lo); this->_tft.print("21: ");  this->_tft.setCursor(2*io, 10*lo);  this->_tft.print(" 22: "); this->_tft.setCursor(4*io, 10*lo);  this->_tft.print(" 23: "); 
-  this->_tft.setCursor(0*io, 11*lo); this->_tft.print("31: ");  this->_tft.setCursor(2*io, 11*lo);  this->_tft.print(" 32: "); this->_tft.setCursor(4*io, 11*lo);  this->_tft.print(" 33: "); 
-  this->_tft.setCursor(0*io, 12*lo); this->_tft.print("41: ");  this->_tft.setCursor(2*io, 12*lo);  this->_tft.print(" 42: "); this->_tft.setCursor(4*io, 12*lo);  this->_tft.print(" 43: "); 
-
+void Qutee::tft_ros_status(const char* msg, uint16_t color) {
+  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+  tft_line(this->_tft, ROS_ROW, msg, color);
 }
 
-void Qutee::tft_update_data_screen(const State_t& state, const Actions_t& actions, float freq) {
-  int lo = 10; // line offset
-  int io = 32; // item offset
-  char buf[6]; // 5 characters + NUL
-  this->_tft.setTextSize(1);
-  this->_tft.setTextColor(ST77XX_WHITE,ST77XX_BLACK); 
-  sprintf(buf, "%-2.2f",freq);
-  this->_tft.setCursor(200 , 0);   this->_tft.setTextColor(ST77XX_WHITE,ST77XX_BLACK); this->_tft.print(buf);
+// ----- Non-volatile storage: IMU calibration and the robot's name ----- //
 
-  this->_tft.setTextSize(1);
-  // State
-  for(size_t i=0; i < NN_INPUT_SIZE; i++){
-    sprintf(buf, "%- 1.2f",state(i,0) );
-    this->_tft.setCursor( ((i%3) *2 +1)*io, (i/3 + 1)*lo); this->_tft.print(buf); 
-  }
-   // Actions
-  for(size_t i=0; i < NN_OUTPUT_SIZE; i++){
-    sprintf(buf, "%- 1.2f",actions(i,0) );
-    this->_tft.setCursor( ((i%3) *2 +1)*io, (i/3 + 9)*lo); this->_tft.print(buf); 
-  }
- 
-}
-
-// function to initialise the non-volatile storage of the qutee. Mostly used to store calibration data. 
-void Qutee::init_NVS(){ 
-    // Initialize NVS
+void Qutee::init_NVS(){
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         // NVS partition was truncated and needs to be erased
-        // Retry nvs_flash_init
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
@@ -281,111 +266,500 @@ void Qutee::init_NVS(){
 }
 
 void Qutee::manage_imu_calibration_nvs(uint8_t* calibration_data, size_t size, bool write = false){
-  this->init_NVS();  
-  ESP_LOGI("NVS STORAGE: ","Opening Non-Volatile Storage (NVS) handle... ");
+  this->init_NVS();
   nvs_handle_t nvs_handle;
-  esp_err_t err;
-  err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
-  
+  esp_err_t err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
   if (err != ESP_OK) {
     ESP_LOGE("NVS STORAGE: ","Error (%s) opening NVS handle!", esp_err_to_name(err));
-  } else {
-      ESP_LOGI("NVS STORAGE: ","Done");
-      size_t  required_size = size * sizeof(uint8_t);
-      ESP_LOGI("NVS STORAGE: ","handling %d bits.", required_size);
-      if(write){// WRITE
-	// Write value
-	err = nvs_set_blob(nvs_handle, "imu_cal", calibration_data, required_size);
-	if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Write Failed, error: %s",  esp_err_to_name(err)); } else{ESP_LOGI("NVS STORAGE: ","Write Done");}
-	// Commit
-	err = nvs_commit(nvs_handle);
-	if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Commit Failed, error: %s", esp_err_to_name(err)); } else{ESP_LOGI("NVS STORAGE: ","Commit Done"); }
-      }
-      else{ // READ
-	err = nvs_get_blob(nvs_handle, "imu_cal", calibration_data, &required_size);
-	if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Read Failed, error: %s", esp_err_to_name(err)); } else{ESP_LOGI("NVS STORAGE: ","Read Done, read %d bits.", required_size); }
-      }
-      // Close
-      nvs_close(nvs_handle);
-  }  
+    return;
+  }
+  size_t required_size = size * sizeof(uint8_t);
+  if(write){
+    err = nvs_set_blob(nvs_handle, "imu_cal", calibration_data, required_size);
+    if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Write Failed, error: %s",  esp_err_to_name(err));}
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Commit Failed, error: %s", esp_err_to_name(err));}
+  }
+  else{
+    err = nvs_get_blob(nvs_handle, "imu_cal", calibration_data, &required_size);
+    if (err != ESP_OK) {ESP_LOGW("NVS STORAGE: ","No IMU calibration read: %s", esp_err_to_name(err));}
+  }
+  nvs_close(nvs_handle);
 }
-
-
 
 void Qutee::load_imu_calibration()
 {
-  uint8_t calibration_data[23]; // adding one value to be set to 42 as sanity check. If loaded value is not 42, this means that data were not properly saved. 
-  this->manage_imu_calibration_nvs(calibration_data, 23, false);// false to READ data
-  if(calibration_data[22] == 42) // proper value loaded
+  uint8_t calibration_data[23] = {}; // one more value, set to 42 as a sanity check: if it isn't 42, the data weren't saved properly
+  this->manage_imu_calibration_nvs(calibration_data, 23, false);
+  if(calibration_data[22] == 42)
     {
       ESP_LOGI("CALIBRATION DATA: "," successfully loaded saved values");
       this->_bno.setSensorOffsets(calibration_data);
-
-      ESP_LOGI("CALIBRATION DATA saved: ","");
-      for(size_t i =0; i<23; i++)
-	ESP_LOGI("","%d : %d", i, calibration_data[i]);
     }
   else
     ESP_LOGI("CALIBRATION DATA: ","no existing calibration data. Calibration is required");
 }
 
-
+// Waits until the IMU is fully calibrated and still (gravity removed) for 1 s, then stores the calibration.
+// A button press cancels it.
 void Qutee::calibration()
 {
   uint8_t system, gyro, accel, mag;
   system = gyro = accel = mag = 0;
+  wait_button_release();
+  {
+    std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+    this->_tft.fillRect(0, 0, 240, MENU_HEIGHT, ST77XX_BLACK);
+  }
+  this->tft_status("Press button to cancel");
 
-  this->_tft.setTextWrap(false);
-  this->_tft.fillScreen(ST77XX_BLACK);
-  this->_tft.setTextColor(ST77XX_BLUE,ST77XX_BLACK); 
-  this->_tft.setTextSize(1);
-  
   uint8_t count =0;
   sensors_event_t  linearAccelData;
   float accel_amp;
-  while(count<10){ // wait for being fullycalibrated and with low acceleration (i.e., learned to remove gravity) for 10 consecutive steps, i.e., one seconds.
+  while(count<10){ // fully calibrated and with low acceleration (i.e., learned to remove gravity) for 10 consecutive steps, i.e., one second.
+    if(this->poll_button() != BUTTON_NONE){
+      this->tft_status("IMU calibration cancelled", ST77XX_YELLOW);
+      return;
+    }
     this->_bno.getEvent(&linearAccelData, Adafruit_BNO055::VECTOR_LINEARACCEL);
     accel_amp = linearAccelData.acceleration.x*linearAccelData.acceleration.x + linearAccelData.acceleration.y*linearAccelData.acceleration.y + linearAccelData.acceleration.z*linearAccelData.acceleration.z;
-    
+
     if(this->_bno.isFullyCalibrated() && accel_amp<0.01)
       count++;
     else
       count=0;
     this->_bno.getCalibration(&system, &gyro, &accel, &mag);
     ESP_LOGI("CALIBRATION: ","system %i, gyro %i, accel %i, mag %i, accel_amp %f",  system , gyro ,accel, mag, accel_amp);
-    this->_tft.setCursor(0, 20);
-    this->_tft.print("system: "); this->_tft.println(system);
-    this->_tft.print("gyro: "); this->_tft.println(gyro);
-    this->_tft.print("accel: "); this->_tft.println(accel);
-    this->_tft.print("mag: "); this->_tft.println(mag);
-    this->_tft.print("Accel amplitude: "); this->_tft.println(accel_amp);
-    this->_tft.print("x: "); this->_tft.print(linearAccelData.acceleration.x);
-    this->_tft.print("y: "); this->_tft.print(linearAccelData.acceleration.y);
-    this->_tft.print("z: "); this->_tft.print(linearAccelData.acceleration.z);
-    std::this_thread::sleep_for(std::chrono::microseconds(100000));
+    {
+      std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+      this->_tft.setTextSize(1);
+      this->_tft.setTextColor(ST77XX_BLUE,ST77XX_BLACK);
+      this->_tft.setCursor(0, 10);
+      this->_tft.print("system: "); this->_tft.println(system);
+      this->_tft.print("gyro: "); this->_tft.println(gyro);
+      this->_tft.print("accel: "); this->_tft.println(accel);
+      this->_tft.print("mag: "); this->_tft.println(mag);
+      this->_tft.print("Accel amplitude: "); this->_tft.println(accel_amp);
+      this->_tft.print("x: "); this->_tft.print(linearAccelData.acceleration.x);
+      this->_tft.print(" y: "); this->_tft.print(linearAccelData.acceleration.y);
+      this->_tft.print(" z: "); this->_tft.println(linearAccelData.acceleration.z);
+    }
+    delay(100);
   }
-  this->_tft.fillScreen(ST77XX_BLACK);
-  this->_tft.setCursor(0, 30);
-  this->_tft.setTextColor(ST77XX_GREEN);
-  this->_tft.setTextSize(4);
-  this->_tft.println("CALIBRATION\n DONE! ");
 
-  uint8_t calibration_data[23]; // adding one value to be set to 42 as sanity check. If loaded value is not 42, this means that data were not properly saved.
+  uint8_t calibration_data[23];
   if(this->_bno.getSensorOffsets(calibration_data)){
-    calibration_data[22]=42; 
-    ESP_LOGI("CALIBRATION DATA obtained: ","");
-    for(size_t i =0; i<23; i++)
-      ESP_LOGI("","%d : %d", i, calibration_data[i]);
-    this->manage_imu_calibration_nvs(calibration_data, 23, true);// false to READ data
+    calibration_data[22]=42;
+    this->manage_imu_calibration_nvs(calibration_data, 23, true);
+    this->tft_status("IMU calibration done and saved", ST77XX_GREEN);
   }
-  else
+  else{
     ESP_LOGE("CALIBRATION: "," ERROR FAILED TO GET CALIBRATION PROFILE");
+    this->tft_status("IMU calibration failed", ST77XX_RED);
+  }
   this->_bno.setMode(OPERATION_MODE_IMUPLUS);
-
-  
 }
 
-// Return the battery's voltage. Given that we use NIMH batteries, the voltage can exceed 5.14V, which is the maximum value that the battery monitor can report. When this happens, the monitor return unexpectedly low values (e.g., 0.01V, or 2.1V). Therefore, this function return 5.15V when the measured value is below 3.5V. 
+std::vector<std::string>  Qutee::get_name_list(){
+  std::vector<std::string> names;
+  std::stringstream ss(CONFIG_QUTEE_NAME);
+  std::string name;
+
+  while (std::getline(ss, name, ';')) {
+    names.push_back(name);
+  }
+  return names;
+}
+
+void Qutee::name_memory(size_t * id, bool write = false){
+  this->init_NVS();
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if (err != ESP_OK) {
+    ESP_LOGE("NVS STORAGE: ","Error (%s) opening NVS handle!", esp_err_to_name(err));
+    return;
+  }
+  size_t required_size = 1 * sizeof(size_t);
+  if(write){
+    err = nvs_set_blob(nvs_handle, "name_id", id, required_size);
+    if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Write Failed, error: %s",  esp_err_to_name(err));}
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Commit Failed, error: %s", esp_err_to_name(err));}
+  }
+  else{
+    err = nvs_get_blob(nvs_handle, "name_id", id, &required_size);
+    if (err != ESP_OK) {ESP_LOGW("NVS STORAGE: ","No robot name stored yet: %s", esp_err_to_name(err));}
+  }
+  nvs_close(nvs_handle);
+}
+
+// The name is the ROS namespace, which is set when ROS starts: a new name applies after a restart
+void Qutee::select_name(){
+  std::vector<std::string> names = this->get_name_list();
+  size_t id = 0;
+  for(size_t i = 0; i < names.size(); i++)
+    if(names[i] == this->name)
+      id = i;
+  wait_button_release();
+  bool redraw = true;
+  while(true){
+    if(redraw){
+      std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+      this->_tft.fillRect(0, 0, 240, MENU_HEIGHT, ST77XX_BLACK);
+      this->_tft.setTextSize(2);
+      this->_tft.setCursor(0, 0);
+      this->_tft.setTextColor(ST77XX_GREEN);
+      this->_tft.println("Select Name");
+      this->_tft.setCursor(0, 50);
+      this->_tft.setTextColor(ST77XX_BLUE);
+      this->_tft.print("> ");
+      this->_tft.println(names[id].c_str());
+      this->tft_status("Press: next name   Hold: select");
+      redraw = false;
+    }
+    Button b = this->poll_button();
+    if(b == BUTTON_SELECT)
+      break;
+    if(b == BUTTON_NEXT){
+      id = (id + 1) % names.size();
+      redraw = true;
+    } else if(b == BUTTON_PREVIOUS){
+      id = (id + names.size() - 1) % names.size();
+      redraw = true;
+    }
+    delay(20);
+  }
+  if(names[id] != this->name){
+    this->name_memory(&id,true);
+    ESP_LOGI("Menu", "Name %s saved: it is used after a restart", names[id].c_str());
+    this->tft_status("Name saved: restart to use it", ST77XX_YELLOW);
+  } else {
+    this->tft_status("Name unchanged");
+  }
+}
+
+// ----- Buttons and menu ----- //
+
+Qutee::Button Qutee::poll_button(){
+  int64_t now = esp_timer_get_time();
+#if QUTEE_THREE_BUTTONS
+  // D1 and D2 are active high: act on the press
+  int extra = (gpio_get_level(GPIO_NUM_1) ? 1 : 0) | (gpio_get_level(GPIO_NUM_2) ? 2 : 0);
+  int pressed_now = extra & ~this->_btn_last_extra;
+  this->_btn_last_extra = extra;
+  if(pressed_now & 1) return BUTTON_SELECT;
+  if(pressed_now & 2) return BUTTON_NEXT;
+#endif
+  bool pressed = !gpio_get_level(GPIO_NUM_0); // D0 is active low
+  if(pressed && !this->_btn_down){
+    this->_btn_down = true;
+    this->_btn_long = false;
+    this->_btn_start = now;
+  } else if(pressed && !this->_btn_long && now - this->_btn_start > LONG_PRESS_US){
+    this->_btn_long = true;
+#if !QUTEE_THREE_BUTTONS
+    return BUTTON_SELECT;
+#endif
+  } else if(!pressed && this->_btn_down){
+    this->_btn_down = false;
+    if(!this->_btn_long && now - this->_btn_start > 30000) // debounce
+      return QUTEE_THREE_BUTTONS ? BUTTON_PREVIOUS : BUTTON_NEXT;
+  }
+  return BUTTON_NONE;
+}
+
+// Wait until no button is pressed, so the press that chose an entry isn't seen again
+void Qutee::wait_button_release(){
+#if QUTEE_THREE_BUTTONS
+  while(!gpio_get_level(GPIO_NUM_0) || gpio_get_level(GPIO_NUM_1) || gpio_get_level(GPIO_NUM_2)) delay(10);
+  this->_btn_last_extra = 0;
+#else
+  while(!gpio_get_level(GPIO_NUM_0)) delay(10);
+#endif
+  delay(50); // debounce
+  this->_btn_down = false;
+}
+
+void Qutee::draw_menu(const std::vector<MenuItem>& items, size_t highlighted){
+  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+  this->_tft.fillRect(0, 0, 240, MENU_HEIGHT, ST77XX_BLACK);
+  this->_tft.setTextWrap(false);
+  this->_tft.setTextSize(2);
+  int spacing = std::min(26, MENU_HEIGHT / (int) std::max<size_t>(1, items.size()));
+  for(size_t i = 0; i < items.size(); i++){
+    this->_tft.setCursor(0, i * spacing);
+    this->_tft.setTextColor(items[i].color);
+    this->_tft.print(i == highlighted ? "> " : "  ");
+    this->_tft.println(items[i].label.c_str());
+  }
+}
+
+// The application's entries first, then the robot's own
+void Qutee::menu_loop(){
+  enum { NAME, CHECKUP, CALIBRATION };
+  std::vector<MenuItem> drawn;
+  size_t highlighted = 0, drawn_highlight = (size_t) -1;
+  wait_button_release();
+  this->tft_status(QUTEE_THREE_BUTTONS ? "D0/D2: move   D1: select" : "Press: next   Hold: select");
+  ESP_LOGI("Menu", "Menu ready");
+  while(true){
+    std::vector<MenuItem> items = this->app_menu_items();
+    size_t nb_app = items.size();
+    std::vector<int> robot_entries = {NAME, CHECKUP};
+    items.push_back({"Select Name", ST77XX_GREEN});
+    items.push_back({"Checkup", ST77XX_RED});
+    if(this->_imu_available){
+      items.push_back({"Calibrate IMU", ST77XX_CYAN});
+      robot_entries.push_back(CALIBRATION);
+    }
+    highlighted = std::min(highlighted, items.size() - 1);
+
+    bool changed = highlighted != drawn_highlight || items.size() != drawn.size();
+    for(size_t i = 0; !changed && i < items.size(); i++)
+      changed = items[i].label != drawn[i].label || items[i].color != drawn[i].color;
+    if(changed){
+      this->draw_menu(items, highlighted);
+      drawn = items;
+      drawn_highlight = highlighted;
+    }
+
+    Button b = this->poll_button();
+    if(b == BUTTON_NEXT)
+      highlighted = (highlighted + 1) % items.size();
+    else if(b == BUTTON_PREVIOUS)
+      highlighted = (highlighted + items.size() - 1) % items.size();
+    else if(b == BUTTON_SELECT){
+      if(highlighted < nb_app){
+        this->on_app_menu_item(highlighted);
+      } else {
+        int entry = robot_entries[highlighted - nb_app];
+        if(entry == NAME){
+          this->select_name();
+        } else if(!this->acquire_motors(entry == CHECKUP ? "checkup" : "IMU calibration")){
+          char msg[48];
+          snprintf(msg, sizeof(msg), "Busy: %s is running", this->motors_owner() ? this->motors_owner() : "?");
+          this->tft_status(msg, ST77XX_YELLOW);
+        } else {
+          if(entry == CHECKUP)
+            this->checkup();
+          else
+            this->calibration();
+          this->release_motors();
+        }
+      }
+      wait_button_release();
+      drawn.clear(); // redraw
+    }
+    delay(20);
+  }
+}
+
+// Held by the ROS task while it reads the joint positions of idle motors (a few ms)
+static const char* const JOINT_READING = "joint reading";
+
+bool Qutee::acquire_motors(const char* activity){
+  for(int attempt = 0; ; attempt++){
+    const char* expected = nullptr;
+    if(this->_motors_owner.compare_exchange_strong(expected, activity))
+      return true;
+    if(expected != JOINT_READING || attempt >= 100){
+      ESP_LOGW("Qutee", "%s refused: %s is using the motors", activity, expected);
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1)); // the joint reading is about to end
+  }
+}
+
+void Qutee::release_motors(){
+  this->_motors_owner = nullptr;
+}
+
+// ----- WiFi and ROS ----- //
+
+void Qutee::start_wifi(){
+#if defined(CONFIG_MICRO_ROS_ESP_NETIF_WLAN) || defined(CONFIG_MICRO_ROS_ESP_NETIF_ENET)
+  this->tft_ros_status("Connecting to WiFi " CONFIG_ESP_WIFI_SSID);
+  ESP_ERROR_CHECK(uros_network_interface_initialize());
+  // uros_network_interface_initialize() also returns when the connection failed, so check for an IP address
+  esp_netif_ip_info_t ip_info = {};
+  esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if(netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0){
+    char msg[40];
+    snprintf(msg, sizeof(msg), "WiFi connected, IP " IPSTR, IP2STR(&ip_info.ip));
+    this->tft_ros_status(msg, ST77XX_GREEN);
+    udp_log_start();
+  }
+  else
+    this->tft_ros_status("WiFi failed: check SSID/password", ST77XX_RED);
+#endif
+}
+
+void Qutee::ros_task(void* arg){
+  static_cast<Qutee*>(arg)->ros_loop();
+  vTaskDelete(NULL);
+}
+
+static rclc_parameter_server_t param_server;
+static rcl_publisher_t joint_publisher;
+static sensor_msgs__msg__JointState joint_state;
+static double joint_positions[Qutee::NB_MOTORS];
+
+bool Qutee::on_parameter_changed(const Parameter* old_param, const Parameter* new_param, void* context)
+{
+  (void) old_param;
+  (void) context;
+  if(new_param == NULL)
+    return false; // parameters can't be deleted
+  Qutee* robot = Qutee::instance();
+  if(strcmp(new_param->name.data, "torque_off_at_rest") == 0){
+    robot->set_torque_off_at_rest(new_param->value.bool_value);
+    return true;
+  }
+  return robot->ros_parameter_changed(new_param);
+}
+
+void Qutee::status_callback(const void* req, void* res){
+  (void) req;
+  static char empty_message = '\0';
+  qutee_interface__srv__Status_Response* res_in = (qutee_interface__srv__Status_Response*) res;
+  Qutee* robot = Qutee::instance();
+  ESP_LOGI("ROS: ","Service Status request received");
+  res_in->battery = robot->battery_voltage();
+  res_in->number_weights = robot->number_weights();
+  // Motor problems found since the last rollout or controller start (empty if none)
+  const std::string& report = robot->get_motor_report();
+  res_in->error_message.data = report.empty() ? &empty_message : const_cast<char*>(report.c_str());
+  res_in->error_message.size = report.size();
+  res_in->error_message.capacity = report.size() + 1;
+}
+
+// Connects to the agent (retrying until it answers), creates the node /<name>/qutee_node with the status
+// service and the parameter server, lets the application add its own, and spins forever.
+void Qutee::ros_loop(){
+  this->_ros_task_handle = xTaskGetCurrentTaskHandle();
+  rcl_allocator_t allocator = rcl_get_default_allocator();
+  rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
+  RCCHECK(rcl_init_options_init(&init_options, allocator));
+  RCCHECK(rcl_init_options_set_domain_id(&init_options, 0));
+#ifdef CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE
+  rmw_init_options_t* rmw_options = rcl_init_options_get_rmw_init_options(&init_options);
+  RCCHECK(rmw_uros_options_set_udp_address(CONFIG_MICRO_ROS_AGENT_IP, CONFIG_MICRO_ROS_AGENT_PORT, rmw_options));
+  // A client key that stays the same across resets (from the MAC address): the agent then replaces the
+  // robot's previous session instead of keeping its stale services alongside the new ones
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  uint32_t client_key = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
+  RCCHECK(rmw_uros_options_set_client_key(client_key ^ this->_ros_client_key_salt, rmw_options));
+#endif
+
+  rclc_support_t support;
+  this->tft_ros_status("Connecting to agent " CONFIG_MICRO_ROS_AGENT_IP ":" CONFIG_MICRO_ROS_AGENT_PORT);
+  bool warned = false;
+  while(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator) != RCL_RET_OK){
+    if(!warned){
+      ESP_LOGW("UROS","Could not reach the micro-ROS agent at " CONFIG_MICRO_ROS_AGENT_IP ":" CONFIG_MICRO_ROS_AGENT_PORT ", retrying");
+      this->tft_ros_status("Agent unreachable, retrying...", ST77XX_RED);
+      warned = true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+
+  rcl_node_t node;
+  RCCHECK(rclc_node_init_default(&node, "qutee_node", this->name.c_str(), &support));
+
+  rclc_parameter_options_t options = {};
+  options.notify_changed_over_dds = false;
+  options.max_params = 1 + this->ros_parameters();
+  options.allow_undeclared_parameters = false;
+  options.low_mem_mode = false;
+  RCCHECK(rclc_parameter_server_init_with_option(&param_server, &node, &options));
+  RCCHECK(rclc_add_parameter(&param_server, "torque_off_at_rest", RCLC_PARAMETER_BOOL));
+  RCCHECK(rclc_parameter_set_bool(&param_server, "torque_off_at_rest", this->torque_off_at_rest()));
+
+  rclc_executor_t executor;
+  unsigned int num_handles = 1 + RCLC_EXECUTOR_PARAMETER_SERVER_HANDLES + this->ros_handles();
+  RCCHECK(rclc_executor_init(&executor, &support.context, num_handles, &allocator));
+
+  rcl_service_t service_status;
+  static qutee_interface__srv__Status_Response res_status;
+  static qutee_interface__srv__Status_Request req_status;
+  RCCHECK(rclc_service_init_default(&service_status, &node, ROSIDL_GET_SRV_TYPE_SUPPORT(qutee_interface, srv, Status), "status"));
+  RCCHECK(rclc_executor_add_service(&executor, &service_status, &req_status, &res_status, status_callback));
+
+  // The application's services and parameters; the parameter server is added to the executor once all
+  // parameters have their initial values
+  this->ros_setup(&node, &executor, &param_server);
+  RCCHECK(rclc_executor_add_parameter_server(&executor, &param_server, on_parameter_changed));
+
+  // joint_states: the 12 joint positions, names "11".."43" (motor IDs), in radians from the standing pose
+  RCCHECK(rclc_publisher_init_best_effort(&joint_publisher, &node,
+                                          ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState), "joint_states"));
+  static char joint_names[NB_MOTORS][4];
+  static rosidl_runtime_c__String names[NB_MOTORS];
+  static char empty_frame[] = "";
+  for(int i = 0; i < NB_MOTORS; i++){
+    snprintf(joint_names[i], sizeof(joint_names[i]), "%d", DXL_IDs[i]);
+    names[i].data = joint_names[i];
+    names[i].size = strlen(joint_names[i]);
+    names[i].capacity = sizeof(joint_names[i]);
+  }
+  joint_state.name.data = names;
+  joint_state.name.size = joint_state.name.capacity = NB_MOTORS;
+  joint_state.position.data = joint_positions;
+  joint_state.position.size = joint_state.position.capacity = NB_MOTORS;
+  joint_state.velocity.size = joint_state.effort.size = 0;
+  joint_state.header.frame_id.data = empty_frame;
+  joint_state.header.frame_id.size = 0;
+  joint_state.header.frame_id.capacity = sizeof(empty_frame);
+  // Time stamps from the agent's clock when available, else the time since boot
+  this->_time_synced = rmw_uros_sync_session(1000) == RMW_RET_OK;
+  this->_next_joint_publish = esp_timer_get_time();
+  this->_joint_publisher_ready = true;
+
+  char msg[48];
+  snprintf(msg, sizeof(msg), "ROS ready: /%s/qutee_node", this->name.c_str());
+  ESP_LOGI("UROS", "%s (time %s)", msg, this->_time_synced ? "synced with the agent" : "since boot");
+  this->tft_ros_status(msg, ST77XX_GREEN);
+  this->_ros_ready = true;
+
+  // Ping the agent regularly: without traffic from the robot, NAT between the robot and the
+  // agent (e.g. Docker port forwarding) drops the UDP flow and service requests never arrive.
+  const int64_t keepalive_period_us = 5000000;
+  int64_t last_keepalive = esp_timer_get_time();
+  while(true){
+    // Soft check: a reply that fails to send (e.g. too large) must not stop the ROS task
+    RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5)));
+    this->ros_spin(&param_server);
+    this->publish_joint_states_if_due();
+    if(esp_timer_get_time() - last_keepalive > keepalive_period_us){
+      if(rmw_uros_ping_agent(100, 1) != RMW_RET_OK)
+        ESP_LOGW("UROS","No answer from the agent to the keepalive ping");
+      last_keepalive = esp_timer_get_time();
+    }
+    int64_t wait_us = this->_next_joint_publish - esp_timer_get_time();
+    vTaskDelay(pdMS_TO_TICKS(std::max<int64_t>(5, std::min<int64_t>(wait_us, 50000) / 1000)));
+  }
+}
+
+void Qutee::publish_joint_states_if_due(){
+  const int64_t joint_period_us = 50000; // 20 Hz
+  int64_t now = esp_timer_get_time();
+  if(now < this->_next_joint_publish)
+    return;
+  this->_next_joint_publish = std::max(this->_next_joint_publish + joint_period_us, now); // late: don't catch up
+  float latest[NB_MOTORS];
+  this->latest_positions(latest);
+  for(int i = 0; i < NB_MOTORS; i++)
+    joint_positions[i] = latest[i] * (M_PI / 4.0); // 1 = 45 deg
+  int64_t ns = this->_time_synced ? rmw_uros_epoch_nanos() : now * 1000;
+  joint_state.header.stamp.sec = (int32_t) (ns / 1000000000);
+  joint_state.header.stamp.nanosec = (uint32_t) (ns % 1000000000);
+  RCSOFTCHECK(rcl_publish(&joint_publisher, &joint_state, NULL));
+}
+
+// ----- Battery and motors ----- //
+
+// Return the battery's voltage. Given that we use NIMH batteries, the voltage can exceed 5.14V, which is the maximum value that the battery monitor can report. When this happens, the monitor return unexpectedly low values (e.g., 0.01V, or 2.1V). Therefore, this function return 5.15V when the measured value is below 3.5V.
 float Qutee::battery_voltage()
 {
   if (!this->_battery_monitor_available)
@@ -396,26 +770,22 @@ float Qutee::battery_voltage()
       voltage = 5.15;
       ESP_LOGW("BATTERY: ","measured voltage unexpectedly low. We assume that it means that the battery's voltage is higher than 5.14V. Returning 5.15V instead. ");
     }
-  return voltage;  
+  return voltage;
 }
-
-
 
 void Qutee::scan()
 {
-  // put your setup code here, to run once:
   int8_t found_dynamixel = 0;
   for(int id = 0; id < DXL_BROADCAST_ID; id++) {
-      //iterate until all ID in each buadrate is scanned.
       if(this->_dxl.ping(id)) {
       ESP_LOGI("DXL: ","ID : %i  , Model Number: %i",id,this->_dxl.getModelNumber(id));
       found_dynamixel++;
       }
-  }   
+  }
   ESP_LOGI("DXL: ","Total %i DYNAMIXEL(s) found!",found_dynamixel );
   char msg[32];
-  snprintf(msg, sizeof(msg), "Motors found: %i/%i", found_dynamixel, DXL_ID_CNT);
-  this->tft_status(msg, found_dynamixel == DXL_ID_CNT ? ST77XX_GREEN : ST77XX_YELLOW);
+  snprintf(msg, sizeof(msg), "Motors found: %i/%i", found_dynamixel, NB_MOTORS);
+  this->tft_status(msg, found_dynamixel == NB_MOTORS ? ST77XX_GREEN : ST77XX_YELLOW);
   delay(1000);
 }
 
@@ -431,7 +801,7 @@ void Qutee::check_motor_power()
     answered = 0;
     int lowest_id = -1;
     float lowest_voltage = 100.0f;
-    for(int i = 0; i < DXL_ID_CNT; i++){
+    for(int i = 0; i < NB_MOTORS; i++){
       int32_t raw = this->_dxl.readControlTableItem(PRESENT_INPUT_VOLTAGE, DXL_IDs[i]);
       if(this->_dxl.getLastLibErrCode() != DXL_LIB_OK)
         continue;
@@ -441,7 +811,7 @@ void Qutee::check_motor_power()
         lowest_id = DXL_IDs[i];
       }
     }
-    // No motor answering is reported later by scan(), as before
+    // No motor answering is reported later by scan()
     if(answered == 0 || lowest_voltage >= min_voltage)
       break;
     if(!waiting_shown){
@@ -459,9 +829,6 @@ void Qutee::check_motor_power()
   this->reboot_faulted_motors(true);
 }
 
-// Reboot the motors with a latched hardware error (a fault turns the motor's torque off until it
-// is rebooted), and add each fault to _motor_report. Returns the number of motors rebooted.
-// The caller must set up the rebooted motors again (init_motors), since a reboot resets them.
 // Hardware Error Status of a motor: 0 if none, -1 if it couldn't be read. It is one byte with only bits
 // 0, 2, 3, 4 and 5 used, so anything else is a garbled reply (seen once as 0x9e0) and is reported as -1.
 int32_t Qutee::read_hardware_error(int id)
@@ -476,10 +843,13 @@ int32_t Qutee::read_hardware_error(int id)
   return error;
 }
 
+// Reboot the motors with a latched hardware error (a fault turns the motor's torque off until it
+// is rebooted), and add each fault to the motor report. Returns the number of motors rebooted.
+// The caller must set up the rebooted motors again (init_motors), since a reboot resets them.
 int Qutee::reboot_faulted_motors(bool log_healthy)
 {
   int rebooted = 0;
-  for(int i = 0; i < DXL_ID_CNT; i++){
+  for(int i = 0; i < NB_MOTORS; i++){
     int id = DXL_IDs[i];
     int32_t error = this->read_hardware_error(id);
     if(error < 0)
@@ -503,7 +873,7 @@ int Qutee::reboot_faulted_motors(bool log_healthy)
     return 0;
   delay(1000); // the motors take a moment to restart
 
-  for(int i = 0; i < DXL_ID_CNT; i++){
+  for(int i = 0; i < NB_MOTORS; i++){
     int id = DXL_IDs[i];
     int32_t error = this->read_hardware_error(id);
     if(error > 0){
@@ -520,9 +890,9 @@ int Qutee::reboot_faulted_motors(bool log_healthy)
 
 void Qutee::init_motors()
 {
-          // Turn off torque when configuring items in EEPROM area
-  for(size_t i = 0; i<12; i++)
-  {   
+  for(size_t i = 0; i < NB_MOTORS; i++)
+  {
+    // Turn off torque when configuring items in EEPROM area
     this->_dxl.torqueOff(this->DXL_IDs[i]);
     this->_dxl.setOperatingMode(this->DXL_IDs[i], OP_POSITION);
     // Time-based motion profile (Drive Mode bit 2, an EEPROM item, so with the torque off): Profile Velocity
@@ -530,34 +900,32 @@ void Qutee::init_motors()
     int32_t drive_mode = this->_dxl.readControlTableItem(DRIVE_MODE, DXL_IDs[i]);
     if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && !(drive_mode & 0x04))
       this->_dxl.writeControlTableItem(DRIVE_MODE, DXL_IDs[i], drive_mode | 0x04);
-    // Full output (homeokinesis may lower it; it stays in EEPROM if the robot was switched off meanwhile)
+    // Full output (a controller may lower it; it stays in EEPROM if the robot was switched off meanwhile)
     int32_t pwm_limit = this->_dxl.readControlTableItem(PWM_LIMIT, DXL_IDs[i]);
     if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && pwm_limit != 885)
       this->_dxl.writeControlTableItem(PWM_LIMIT, DXL_IDs[i], 885);
     this->_dxl.torqueOn(this->DXL_IDs[i]);
-    ESP_LOGI("DXL: ","TORQUE ON" );
     // No motion profile (0): the motor reaches each target as fast as it can
     this->_dxl.writeControlTableItem(PROFILE_VELOCITY, DXL_IDs[i], 0);
     this->_dxl.writeControlTableItem(PROFILE_ACCELERATION, DXL_IDs[i], 0);
-    this->set_PID_gains();
   }
+  this->set_PID_gains();
+  ESP_LOGI("DXL: ","Torque on");
   this->_torque_on = true;
 }
 
 void Qutee::set_PID_gains()
 {
-  // adjust these values depending on how your robot behaves. 0.05 looks like a good target to have on all motors during checkup. 
+  // adjust these values depending on how your robot behaves. 0.05 looks like a good target to have on all motors during checkup.
   uint16_t position_p_gain = 1600;
   uint16_t position_i_gain = 0;
   uint16_t position_d_gain = 40;
-  // Set Position PID Gains
-  for(size_t i = 0; i<12; i++)
+  for(size_t i = 0; i < NB_MOTORS; i++)
   {
     this->_dxl.writeControlTableItem(POSITION_P_GAIN, this->DXL_IDs[i], position_p_gain);
     this->_dxl.writeControlTableItem(POSITION_I_GAIN, this->DXL_IDs[i], position_i_gain);
     this->_dxl.writeControlTableItem(POSITION_D_GAIN, this->DXL_IDs[i], position_d_gain);
   }
-  return;
 }
 
 // Pose with joint 2 of every leg raised by angle_deg (positive joint 2 moves a leg down) and the
@@ -579,7 +947,7 @@ void Qutee::move_slowly(const Actions_t& target, int duration_ms)
   State_t state;
   this->get_motor_positions(state, 6);
   Actions_t start;
-  for(size_t i = 0; i < DXL_ID_CNT; i++)
+  for(size_t i = 0; i < NB_MOTORS; i++)
     start(i, 0) = state(6 + i, 0);
   int steps = std::max(1, duration_ms * CONFIG_CONTROL_FREQUENCY / 1000);
   for(int s = 1; s <= steps; s++){
@@ -601,7 +969,7 @@ void Qutee::move_slowly(const Actions_t& target, int duration_ms)
 // while the torque is on.
 void Qutee::set_servo_motion(int profile_ms, int p_gain)
 {
-  for(size_t i = 0; i < DXL_ID_CNT; i++){
+  for(size_t i = 0; i < NB_MOTORS; i++){
     this->_dxl.writeControlTableItem(PROFILE_VELOCITY, DXL_IDs[i], profile_ms);
     this->_dxl.writeControlTableItem(PROFILE_ACCELERATION, DXL_IDs[i], profile_ms / 4);
     this->_dxl.writeControlTableItem(POSITION_P_GAIN, DXL_IDs[i], p_gain);
@@ -613,7 +981,7 @@ void Qutee::set_servo_motion(int profile_ms, int p_gain)
 // differs are written, to spare their EEPROM.
 void Qutee::set_pwm_limit(int limit)
 {
-  for(size_t i = 0; i < DXL_ID_CNT; i++){
+  for(size_t i = 0; i < NB_MOTORS; i++){
     int32_t current = this->_dxl.readControlTableItem(PWM_LIMIT, DXL_IDs[i]);
     if(this->_dxl.getLastLibErrCode() == DXL_LIB_OK && current != limit)
       this->_dxl.writeControlTableItem(PWM_LIMIT, DXL_IDs[i], limit);
@@ -658,12 +1026,12 @@ void Qutee::set_torque(bool on)
     State_t state;
     this->get_motor_positions(state, 6);
     Actions_t here;
-    for(size_t i = 0; i < DXL_ID_CNT; i++)
+    for(size_t i = 0; i < NB_MOTORS; i++)
       here(i, 0) = state(6 + i, 0);
     this->send_actions(here);
   }
   // A motor can miss the command (its reply lost on the bus), so read Torque Enable back and retry
-  for(size_t i = 0; i < DXL_ID_CNT; i++){
+  for(size_t i = 0; i < NB_MOTORS; i++){
     int id = DXL_IDs[i];
     bool done = false;
     int attempt;
@@ -697,150 +1065,113 @@ void Qutee::go_to_standing_pose()
 
 void Qutee::displaySensorStatus(void)
 {
-  /* Get the system status values (mostly for debugging purposes) */
   uint8_t system_status, self_test_results, system_error;
   system_status = self_test_results = system_error = 0;
   this->_bno.getSystemStatus(&system_status, &self_test_results, &system_error);
-
-  /* Display the results in the Serial Monitor */
-  ESP_LOGI("IMU" ,"System Status: 0x%x, Self Test: 0x%x, System Error:  0x%x", system_status, self_test_results, system_error);   
+  ESP_LOGI("IMU" ,"System Status: 0x%x, Self Test: 0x%x, System Error:  0x%x", system_status, self_test_results, system_error);
   delay(500);
 }
 
 void Qutee::get_state(State_t& state_ref)
-{    
+{
   sensors_event_t orientationData = {}, linearAccelData = {};
   if(this->_imu_available){
     this->_bno.getEvent(&orientationData, Adafruit_BNO055::VECTOR_EULER);
-    //  bno.getEvent(&angVelData, Adafruit_BNO055::VECTOR_GYROSCOPE);
     this->_bno.getEvent(&linearAccelData, Adafruit_BNO055::VECTOR_LINEARACCEL);
   }
-  
+
   state_ref.setValues({{this->DEG_2_RAD * orientationData.orientation.x},
                   {this->DEG_2_RAD * orientationData.orientation.y},
                   {this->DEG_2_RAD * orientationData.orientation.z},
-                  {linearAccelData.acceleration.x}, 
+                  {linearAccelData.acceleration.x},
                   {linearAccelData.acceleration.y},
                   {linearAccelData.acceleration.z}});
 
   this->get_motor_positions(state_ref,6);
-
 }
 
 void Qutee::send_actions(const Actions_t& actions){
-  uint8_t i;
-  // Insert a new Goal Position to the SyncWrite Packet
-  for(i = 0; i < this->DXL_ID_CNT; i++){
+  for(uint8_t i = 0; i < NB_MOTORS; i++){
     this->_sw_data[i].goal_position = (size_t) 2048+actions(i,0)*512;
   }
-
-  // Update the SyncWrite packet status
   this->_sw_infos.is_info_changed = true;
-  
-  // Build a SyncWrite Packet and transmit to DYNAMIXEL  
-  if(this->_dxl.syncWrite(&this->_sw_infos) == true){
-    //ESP_LOGI("Control Loop","[SyncWrite] Success");
-  } else {
-    //ESP_LOGE("Control Loop","[SyncWrite] Fail, Lib error code: %i ",this->_dxl.getLastLibErrCode()); // TODO fix this error
-  }
-
+  // Build a SyncWrite Packet and transmit to DYNAMIXEL
+  this->_dxl.syncWrite(&this->_sw_infos);
 }
 
 void Qutee::get_motor_positions(State_t& state_ref, size_t offset)
 {
-  // Transmit predefined SyncRead instruction packet
-  // and receive a status packet from each DYNAMIXEL
   // SyncRead stops at the first motor that doesn't answer, so only the first recv_cnt motors
   // are fresh. The others keep their last known position.
   // Replies get lost now and then, more often while the legs carry the robot (higher currents).
   // A SyncRead takes about 4 ms of the 20 ms control period, so retry once.
   uint8_t i, recv_cnt;
   recv_cnt = this->_dxl.syncRead(&this->_sr_infos);
-  if(recv_cnt < DXL_ID_CNT)
+  if(recv_cnt < NB_MOTORS)
     recv_cnt = this->_dxl.syncRead(&this->_sr_infos);
   for(i = 0; i<recv_cnt; i++)
     this->_last_positions[i] = (this->_sr_data[i].present_position-2048.0f)/512.0f;
-  if(recv_cnt < DXL_ID_CNT)
+  if(recv_cnt < NB_MOTORS)
     this->_incomplete_reads++;
-  for(i = 0; i<DXL_ID_CNT; i++)
+  for(i = 0; i<NB_MOTORS; i++)
     state_ref(i+offset,0) = this->_last_positions[i];
+  {
+    std::lock_guard<std::mutex> lock(this->_published_positions_lock);
+    std::copy(this->_last_positions, this->_last_positions + NB_MOTORS, this->_published_positions);
+    this->_published_positions_time = esp_timer_get_time();
+  }
+  // A read on the ROS task happens during a service callback (e.g. a rollout): publish from here
+  if(this->_joint_publisher_ready && xTaskGetCurrentTaskHandle() == this->_ros_task_handle)
+    this->publish_joint_states_if_due();
 }
 
-void Qutee::control_step(State_t& state_to_fill, Actions_t& actions_to_fill){
-  //Get state
-
-  this->get_state(state_to_fill);
-  // Call policy
-  this->_policy.pos(state_to_fill, actions_to_fill);
-  // Send actions
-  this->send_actions(actions_to_fill);
-  // Print on screen. This takes ages, so disabled for now
-  //this->tft_update_data_screen(_state, pos, 1000.0f / (float) full_period ); // period is in us        
- }
-
-void Qutee::run_episode(){
-  // A motor that tripped (e.g. overload) in an earlier episode stays limp until it is rebooted
-  this->_motor_report.clear();
-  if(this->reboot_faulted_motors(false) > 0)
-    this->init_motors(); // a reboot turns torque off and resets the gains
-  this->go_to_standing_pose();
-  std::this_thread::sleep_for(std::chrono::microseconds(1000000));
-  this->_incomplete_reads = 0; // count only the episode's reads
-  int64_t start, sleep_duration;
-  int64_t start_loop = esp_timer_get_time();
-  for(size_t step = 0;step< NB_STEPS; step++)
-  {  
-    State_t state_to_fill;
-    Actions_t actions_to_fill;
-
-    start = esp_timer_get_time();
-
-    control_step(state_to_fill,actions_to_fill);
-    _states[step] = state_to_fill;
-    _actions[step] = actions_to_fill;
-
-    sleep_duration = PERIOD - (esp_timer_get_time() - start);
-    //ESP_LOGI("Control Loop", "Period: %" PRId64" Start: %" PRId64" Sleep %" PRId64,period,  start, sleep_duration);
-    if(sleep_duration>0)
-      std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));   
-    else
-      ESP_LOGE("Control Loop"," Error: loop duration: %" PRId64" longer than period: ", esp_timer_get_time() - start);
+// The newest joint positions: those read by the activity that has the motors, or, when the motors are
+// idle, read now (taking the motors for the few ms of a SyncRead)
+void Qutee::latest_positions(float* positions){
+  const char* expected = nullptr;
+  bool idle = false;
+  {
+    std::lock_guard<std::mutex> lock(this->_published_positions_lock);
+    idle = esp_timer_get_time() - this->_published_positions_time > 30000; // no read in the last 30 ms
   }
-  ESP_LOGI("Control Loop", "duration of the loop: %" PRId64, esp_timer_get_time() - start_loop);
-  if(this->_incomplete_reads > 0){
-    ESP_LOGW("Control Loop", "%d of %d motor reads were incomplete; missing positions kept their last value",
-             this->_incomplete_reads, (int) NB_STEPS);
-    this->_motor_report += std::to_string(this->_incomplete_reads) + " incomplete motor reads; ";
+  if(idle && this->_motors_owner.compare_exchange_strong(expected, JOINT_READING)){
+    State_t state;
+    this->get_motor_positions(state, 6);
+    this->release_motors();
   }
-  this->go_to_rest_pose();
- }
+  std::lock_guard<std::mutex> lock(this->_published_positions_lock);
+  std::copy(this->_published_positions, this->_published_positions + NB_MOTORS, positions);
+}
 
+// ----- Checkup ----- //
 
-
+// Stands up, then moves all motors in a slow sine wave and shows each one's average position error,
+// until a button is pressed. The caller holds the motors.
 void Qutee::checkup(){
-  this->_tft.fillScreen(ST77XX_BLACK);
-  this->_tft.setTextSize(2);
-  this->_tft.setCursor(0, 0);
-  this->_tft.setTextColor(ST77XX_BLUE);
-  this->_tft.println("CHECKUP");
+  {
+    std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+    this->_tft.fillRect(0, 0, 240, MENU_HEIGHT, ST77XX_BLACK);
+    this->_tft.setTextSize(2);
+    this->_tft.setCursor(0, 0);
+    this->_tft.setTextColor(ST77XX_BLUE);
+    this->_tft.println("CHECKUP");
+  }
+  this->tft_status("Standing up...");
+  wait_button_release();
 
   go_to_standing_pose();
-  std::this_thread::sleep_for(std::chrono::microseconds(1000000));
+  delay(1000);
   int64_t start, sleep_duration;
   int64_t start_loop = esp_timer_get_time();
   State_t state;
   Actions_t actions;
   float action_value=0;
   int32_t step = 0;
-  float er[12];
-  for(size_t i=0;i<12;i++)
-    er[i]=0;
-			
+  float er[NB_MOTORS] = {};
+
   this->tft_init_checkup_screen();
   this->tft_status("Press button to exit");
-  while(!gpio_get_level(GPIO_NUM_0)) delay(10); // wait for the button that started the checkup to be released
-
-  while(gpio_get_level(GPIO_NUM_0)) // D0 (active low) exits the checkup
+  while(this->poll_button() == BUTTON_NONE)
   {
     start = esp_timer_get_time();
     this->get_motor_positions(state,6);
@@ -848,38 +1179,35 @@ void Qutee::checkup(){
     if(step % (2 * CONFIG_CONTROL_FREQUENCY)==0)
       this->tft_update_checkup_screen(er);
 
-    for(size_t i=0;i<12;i++)
-      er[i]= (step * er[i] + abs(state(6+i,0)-action_value))/(step+1.0f); //compute rolling average of error
+    for(size_t i=0;i<NB_MOTORS;i++)
+      er[i]= (step * er[i] + fabsf(state(6+i,0)-action_value))/(step+1.0f); //compute rolling average of error
 
     step++;
 
-    //ESP_LOGI("Checkup", "Average execution error: 11:%f 12:%f 13:%f  21:%f 22:%f 23:%f  31:%f 32:%f 33:%f  41:%f 42:%f 43:%f ", er[0],er[1],er[2],er[3],er[4],er[5],er[6],er[7],er[8],er[9],er[10],er[11]);
-
-    action_value = sin(0.5*6.28*(esp_timer_get_time() - start_loop)/1000000.0f); 
+    action_value = sin(0.5*6.28*(esp_timer_get_time() - start_loop)/1000000.0f);
     actions.setConstant(action_value);
-    this->send_actions(actions); // Sends a sin signal of 0.1Hz. 
+    this->send_actions(actions); // a sine wave at 0.5 Hz
 
-    sleep_duration = (PERIOD - (esp_timer_get_time() - start)); 
-
-    //ESP_LOGI("Control Loop", "Period: %" PRId64" Start: %" PRId64" Sleep %" PRId64,period,  start, sleep_duration);
+    sleep_duration = (PERIOD - (esp_timer_get_time() - start));
     if(sleep_duration>0)
-      std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));   
+      std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));
     else
       ESP_LOGE("Checkup"," Error: loop duration: %" PRId64" longer than period: ", esp_timer_get_time() - start);
   }
   ESP_LOGI("Checkup", "duration of the loop: %" PRId64, esp_timer_get_time() - start_loop);
+  this->tft_status("Going back to rest...");
   go_to_rest_pose();
-  while(!gpio_get_level(GPIO_NUM_0)) delay(10); // wait for release, so the menu doesn't see this press
-  delay(50); // debounce
- }
+  this->tft_status("Checkup done");
+}
 
 // Checkup screen layout (text size 2, 12x16 px characters): one row per leg, one column per joint,
 // i.e. motor ID = 10*leg + joint
-#define CHECKUP_LINE_OFFSET 24 // pixels between rows
+#define CHECKUP_LINE_OFFSET 22 // pixels between rows
 #define CHECKUP_COL_X(joint) ((3 + 5 * (joint)) * 12) // x of the value column for joint 0..2
 
 void Qutee::tft_init_checkup_screen() {
-  this->_tft.fillScreen(ST77XX_BLACK);
+  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
+  this->_tft.fillRect(0, 0, 240, MENU_HEIGHT, ST77XX_BLACK);
   this->_tft.setTextSize(2);
   this->_tft.setTextColor(ST77XX_RED,ST77XX_BLACK);
   this->_tft.setCursor(0, 0);    this->_tft.print("Err");
@@ -893,9 +1221,10 @@ void Qutee::tft_init_checkup_screen() {
 }
 
 void Qutee::tft_update_checkup_screen(const float* err) {
+  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
   char buf[8];
   this->_tft.setTextSize(2);
-  for(size_t i=0; i < 12; i++){
+  for(size_t i=0; i < NB_MOTORS; i++){
     if(err[i]>0.1)
       this->_tft.setTextColor(ST77XX_RED,ST77XX_BLACK);
     else
@@ -903,523 +1232,4 @@ void Qutee::tft_update_checkup_screen(const float* err) {
     snprintf(buf, sizeof(buf), "%4.2f", err[i]);
     this->_tft.setCursor(CHECKUP_COL_X(i%3), (i/3 + 1) * CHECKUP_LINE_OFFSET); this->_tft.print(buf);
   }
-
-}
-
-
-void Qutee::print_state(){
-  State_t state;
-  uint16_t BNO055_SAMPLERATE_DELAY_MS = 10; //how often to read data from the board (Taken from the lib example, probably wrong)
-  //velocity = accel*dt (dt in seconds)
-  //position = 0.5*accel*dt^2
-  double ACCEL_VEL_TRANSITION =  (double)(BNO055_SAMPLERATE_DELAY_MS) / 1000.0;
-  double ACCEL_POS_TRANSITION = 0.5 * ACCEL_VEL_TRANSITION * ACCEL_VEL_TRANSITION;
-  double xPos = 0, yPos = 0;
-
-  int64_t start = esp_timer_get_time();
-
-  while(1){
-    this->get_state(state);
-    double delta_t = (esp_timer_get_time() - start) /1000000.0;
-    start = esp_timer_get_time();
-    xPos = xPos + 0.5*delta_t*delta_t * state(3,0);
-    yPos = yPos + 0.5*delta_t*delta_t * state(4,0);
-
-
-    printf("%f, %f, %f, %f, %f, %f, %f, %f\n", state(0,0),state(1,0),state(2,0),state(3,0),state(4,0),state(5,0), xPos, yPos);
-    //ESP_LOGI("STATE", "a: %f, b: %f, c: %f, x: %f, y: %f, z: %f", state(0,0),state(1,0),state(2,0),state(3,0),state(4,0),state(5,0));
-  }
-}
-
-
-
-std::vector<std::string>  Qutee::get_name_list(){
-  std::vector<std::string> names;
-  std::stringstream ss(CONFIG_QUTEE_NAME);
-  std::string name;
-  
-  while (std::getline(ss, name, ';')) {
-    names.push_back(name);
-  }
-  return names;
-}
-
-// Wait for a press of D0 (Boot) and return true for a long press, false for a short press.
-// Returns as soon as the long press is detected, then waits for the release.
-bool Qutee::wait_button_press(){
-  while(gpio_get_level(GPIO_NUM_0)) delay(10); // D0 is active low
-  int64_t start = esp_timer_get_time();
-  bool long_press = false;
-  while(!gpio_get_level(GPIO_NUM_0)){
-    if(!long_press && esp_timer_get_time() - start > LONG_PRESS_US){
-      long_press = true;
-      this->tft_status("Selected", ST77XX_GREEN);
-    }
-    delay(10);
-  }
-  delay(50); // debounce
-  return long_press;
-}
-
-void Qutee::select_name(){
-
-  std::vector<std::string> names = this->get_name_list();
-  bool selected = false;
-  size_t id = 0;
-#if !QUTEE_THREE_BUTTONS
-  while(!selected){
-    this->_tft.fillScreen(ST77XX_BLACK);
-    this->_tft.setTextSize(2);
-    this->_tft.setCursor(0, 0);
-    this->_tft.setTextColor(ST77XX_GREEN);
-    this->_tft.println("Select Name");
-    this->_tft.setCursor(0, 50);
-    this->_tft.setTextColor(ST77XX_BLUE);
-    this->_tft.print("> ");
-    this->_tft.println(names[id].c_str());
-    this->tft_status("Press: next name   Hold: select");
-    ESP_LOGI("Menu", "Entering name_select menu. Waiting for a button to be pressed");
-    if(this->wait_button_press())
-      selected = true;
-    else
-      id = (id + 1) % names.size();
-  }
-#else
-  char buf[3]; // 1 characters + NUL
-  while(!selected)
-    {
-      while(!gpio_get_level(GPIO_NUM_0) || gpio_get_level(GPIO_NUM_1) ||gpio_get_level(GPIO_NUM_2)){} // we loop as long as one button is pressed
-      
-      this->_tft.fillScreen(ST77XX_BLACK);
-      this->_tft.setTextSize(2);
-      
-      this->_tft.setCursor(0, 0);
-      this->_tft.setTextColor(ST77XX_GREEN);
-      sprintf(buf, "%c ",30); // print up arrow
-      this->_tft.print(buf);
-      this->_tft.setTextColor(ST77XX_BLUE);
-      if(id>0)
-	this->_tft.println(names[id-1].c_str());
-      else
-	this->_tft.println("");
-      
-      this->_tft.setCursor(0, 60);
-      this->_tft.setTextColor(ST77XX_GREEN);
-      sprintf(buf, "%c ",4);// print diamond
-      this->_tft.print(buf);
-      this->_tft.setTextColor(ST77XX_BLUE);
-      this->_tft.println(names[id].c_str());
-      
-      this->_tft.setCursor(0, 120);
-      this->_tft.setTextColor(ST77XX_GREEN);
-      sprintf(buf, "%c ",31); // print down arrow
-      this->_tft.print(buf);
-      this->_tft.setTextColor(ST77XX_BLUE);
-      if(id+1<names.size()-1)
-	this->_tft.println(names[id+1].c_str());
-      else
-	this->_tft.println("");
-      
-      ESP_LOGI("Menu", "Entering name_select menu. Waiting for a button to be pressed");
-      
-      delay(100);
-      if(!gpio_get_level(GPIO_NUM_0))
-	{
-	  if(id!=0)
-	    id--;
-	}
-      if(gpio_get_level(GPIO_NUM_1))
-	selected = true;
-      if(gpio_get_level(GPIO_NUM_2))
-	  {
-	    id++;
-	    if(id>names.size()-1)
-	      id = names.size()-1;
-	  }
-    }
-#endif
-  this->name = names[id];
-  this->name_memory(&id,true);
-#if QUTEE_THREE_BUTTONS
-  while(!gpio_get_level(GPIO_NUM_0) || gpio_get_level(GPIO_NUM_1) ||gpio_get_level(GPIO_NUM_2)){} // we loop as long as one button is pressed
-#endif
-  delay(100);
-  return;
-}
-	      
-void Qutee::name_memory(size_t * id, bool write = false){
-  this->init_NVS();  
-  ESP_LOGI("NVS STORAGE: ","Opening Non-Volatile Storage (NVS) handle... ");
-  nvs_handle_t nvs_handle;
-  esp_err_t err;
-  err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
-  
-  if (err != ESP_OK) {
-    ESP_LOGE("NVS STORAGE: ","Error (%s) opening NVS handle!", esp_err_to_name(err));
-  } else {
-      ESP_LOGI("NVS STORAGE: ","Done");
-      size_t  required_size = 1 * sizeof(size_t);
-      ESP_LOGI("NVS STORAGE: ","handling %d bits.", required_size);
-      if(write){// WRITE
-	// Write value
-	err = nvs_set_blob(nvs_handle, "name_id", id, required_size);
-	if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Write Failed, error: %s",  esp_err_to_name(err)); } else{ESP_LOGI("NVS STORAGE: ","Write Done");}
-	// Commit
-	err = nvs_commit(nvs_handle);
-	if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Commit Failed, error: %s", esp_err_to_name(err)); } else{ESP_LOGI("NVS STORAGE: ","Commit Done"); }
-      }
-      else{ // READ
-	err = nvs_get_blob(nvs_handle, "name_id", id, &required_size);
-	if (err != ESP_OK) {ESP_LOGE("NVS STORAGE: ","Read Failed, error: %s", esp_err_to_name(err)); } else{ESP_LOGI("NVS STORAGE: ","Read Done, read %d bits.", required_size); }
-      }
-      // Close
-      nvs_close(nvs_handle);
-  }  
-
-
-}
-
-// clear the menu before returning to the main function, where we launch ros and co.
-// The backlight stays on (dim) so the status line shows that the robot is running.
-void Qutee::enter_ros_mode(){
-  if(this->_imu_available && !this->_bno.isFullyCalibrated()) {this->calibration();}
-  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
-  this->_tft.fillScreen(ST77XX_BLACK);
-  this->_tft.setCursor(0, 30);
-  this->_tft.setTextSize(2);
-  this->_tft.setTextColor(ST77XX_GREEN);
-  this->_tft.println(this->name.c_str());
-  this->_tft.println("ROS mode");
-}
-
-// ----- Homeokinesis ----- //
-
-int Qutee::poll_button(){
-  bool pressed = !gpio_get_level(GPIO_NUM_0); // D0 is active low
-  int64_t now = esp_timer_get_time();
-  if(pressed && !this->_btn_down){
-    this->_btn_down = true;
-    this->_btn_long = false;
-    this->_btn_start = now;
-  } else if(pressed && !this->_btn_long && now - this->_btn_start > LONG_PRESS_US){
-    this->_btn_long = true;
-    return 2;
-  } else if(!pressed && this->_btn_down){
-    this->_btn_down = false;
-    if(!this->_btn_long && now - this->_btn_start > 30000) // debounce
-      return 1;
-  }
-  return 0;
-}
-
-void Qutee::hk_screen(){
-  std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
-  this->_tft.fillRect(0, 0, 240, 128, ST77XX_BLACK);
-  this->_tft.setTextWrap(false);
-  this->_tft.setTextSize(2);
-  this->_tft.setCursor(0, 10);
-  this->_tft.setTextColor(ST77XX_YELLOW);
-  this->_tft.println("Homeokinesis");
-  this->_tft.setCursor(0, 50);
-  this->_tft.setTextColor(this->_hk_running ? ST77XX_GREEN : ST77XX_RED);
-  this->_tft.println(this->_hk_running ? "Running" : "Stopped (rest)");
-  this->_tft.setTextSize(1);
-  this->_tft.setCursor(0, 90);
-  this->_tft.setTextColor(ST77XX_WHITE);
-  this->_tft.println("Press: stop/start   Hold: menu");
-}
-
-void Qutee::hk_task(void* robot){
-  static_cast<Qutee*>(robot)->hk_loop();
-  xSemaphoreGive(static_cast<Qutee*>(robot)->_hk_done);
-  vTaskDelete(NULL);
-}
-
-// The controller's matrix work needs more stack than the main task has, so it runs in its own task
-void Qutee::run_homeokinesis(){
-  if(!this->_hk_done)
-    this->_hk_done = xSemaphoreCreateBinary();
-  xTaskCreate(hk_task, "homeokinesis", CONFIG_ROBOT_CTRL_APP_STACK, this, CONFIG_ROBOT_CTRL_APP_TASK_PRIO, NULL);
-  xSemaphoreTake(this->_hk_done, portMAX_DELAY);
-}
-
-void Qutee::hk_loop(){
-  while(!gpio_get_level(GPIO_NUM_0)) delay(10); // release of the press that chose the menu entry
-  this->_btn_down = false;
-  this->_hk_run_request = -1;
-  this->_hk_reset_request = false;
-  this->_hk_settings_changed = true;
-  this->_hk.reset();
-  this->_hk_active = true;
-
-  State_t state;
-  Homeokinesis_t::SensorVec x;
-  Homeokinesis_t::MotorVec target = Homeokinesis_t::MotorVec::Zero(); // smoothed motor targets (0 = standing)
-  Actions_t actions;
-  float amplitude = 0, smoothing = 0, sensor_noise = 0, motor_noise = 0;
-  bool auto_recover = true;
-  // Uniform white noise in [-n, n], from the hardware random number generator
-  auto noise = [](float n) { return n == 0.0f ? 0.0f : (esp_random() * (2.0f / 4294967295.0f) - 1.0f) * n; };
-  // Servo settings as last written to the motors (init_motors sets profile 0, P gain 1600, PWM limit 885)
-  int servo_profile_ms = 0, servo_p_gain = 1600, pwm_limit = 885;
-  auto motors_initialised = [&]() {
-    servo_profile_ms = 0;
-    servo_p_gain = 1600;
-    pwm_limit = 885;
-    this->_hk_settings_changed = true; // write homeokinesis' servo settings again
-  };
-  // PWM Limit is an EEPROM item: only at rest, with the torque off (the torso is on the ground)
-  auto apply_pwm_limit = [&](int limit) {
-    if(limit == pwm_limit)
-      return;
-    this->set_torque(false);
-    this->set_pwm_limit(limit);
-    pwm_limit = limit;
-  };
-  int64_t trips[DXL_ID_CNT][3] = {}; // times of each motor's last 3 overloads, for auto-recovery
-  size_t fault_check = 0; // motor whose hardware error status is read this step (one per step)
-
-  this->_motor_report.clear();
-  if(this->reboot_faulted_motors(false) > 0){
-    this->init_motors();
-    motors_initialised();
-  }
-  apply_pwm_limit(this->hk_settings().servoPwmLimit);
-  this->go_to_standing_pose();
-  this->_hk_running = true;
-  this->hk_screen();
-  ESP_LOGI("HK", "Homeokinesis started");
-  int64_t step_us_sum = 0, step_us_max = 0;
-  int steps_in_log = 0;
-  this->_incomplete_reads = 0;
-  int64_t next = esp_timer_get_time();
-  while(true){
-    // Button: short press stops or restarts, long press goes back to the menu
-    int button = this->poll_button();
-    if(button == 2)
-      break;
-    int request = this->_hk_run_request.exchange(-1);
-    if(button == 1)
-      request = this->_hk_running ? 0 : 1;
-    if(request != -1 && (request == 1) != this->_hk_running){
-      if(request == 1){
-        if(this->reboot_faulted_motors(false) > 0){
-          this->init_motors();
-          motors_initialised();
-        }
-        apply_pwm_limit(this->hk_settings().servoPwmLimit);
-        this->go_to_standing_pose();
-      } else {
-        this->go_to_rest_pose();
-      }
-      this->_hk_running = (request == 1);
-      target.setZero();
-      ESP_LOGI("HK", "Homeokinesis %s", this->_hk_running ? "running" : "stopped");
-      this->hk_screen();
-      next = esp_timer_get_time();
-    }
-    if(this->_hk_reset_request.exchange(false)){
-      this->_hk.reset();
-      ESP_LOGI("HK", "Controller reset");
-    }
-    if(this->_hk_settings_changed.exchange(false)){
-      HkSettings s = this->hk_settings();
-      auto& p = this->_hk.params();
-      p.epsA = s.epsA; p.epsC = s.epsC;
-      p.creativity = s.creativity; p.harmony = s.harmony; p.damping = s.damping; p.causeaware = s.causeaware;
-      p.steps4Delay = s.steps4Delay; p.steps4Averaging = s.steps4Averaging;
-      amplitude = s.amplitude;
-      smoothing = s.motorSmoothing;
-      sensor_noise = s.sensorNoise;
-      motor_noise = s.motorNoise;
-      auto_recover = s.autoRecover;
-      if(s.servoPwmLimit != pwm_limit){
-        // Pause: to rest, change the limit with the torque off, and stand up again if it was running
-        ESP_LOGI("HK", "Changing the PWM limit to %d: going to rest", s.servoPwmLimit);
-        if(this->_hk_running)
-          this->go_to_rest_pose();
-        apply_pwm_limit(s.servoPwmLimit);
-        if(this->_hk_running)
-          this->go_to_standing_pose();
-        target.setZero();
-        next = esp_timer_get_time();
-      }
-      if(s.servoProfileMs != servo_profile_ms || s.servoPGain != servo_p_gain){
-        servo_profile_ms = s.servoProfileMs;
-        servo_p_gain = s.servoPGain;
-        this->set_servo_motion(servo_profile_ms, servo_p_gain);
-      }
-      ESP_LOGI("HK", "Settings: eps_A %g, eps_C %g, creativity %g, harmony %g, damping %g, causeaware %g, "
-               "steps_delay %d, steps_averaging %d, amplitude %g, motor_smoothing %g, sensor_noise %g, "
-               "motor_noise %g", p.epsA, p.epsC, p.creativity, p.harmony, p.damping, p.causeaware, p.steps4Delay,
-               p.steps4Averaging, amplitude, smoothing, sensor_noise, motor_noise);
-    }
-
-    if(this->_hk_running){
-      // Sensors: the 12 joint positions (1 = 45 deg); motors: the 12 joint targets
-      this->get_motor_positions(state, 6);
-      for(size_t i = 0; i < DXL_ID_CNT; i++)
-        x(i) = state(6 + i, 0) + noise(sensor_noise);
-      int64_t t0 = esp_timer_get_time();
-      const Homeokinesis_t::MotorVec& y = this->_hk.step(x);
-      int64_t step_us = esp_timer_get_time() - t0;
-      Homeokinesis_t::MotorVec y_noisy;
-      for(size_t i = 0; i < DXL_ID_CNT; i++)
-        y_noisy(i) = std::clamp(y(i) + noise(motor_noise), -1.0f, 1.0f);
-      target += (y_noisy * amplitude - target) * (1.0f - smoothing);
-      for(size_t i = 0; i < DXL_ID_CNT; i++)
-        actions(i, 0) = target(i);
-      this->send_actions(actions);
-
-      // A motor that trips (e.g. overload) goes limp: stop rather than carry on with a dead joint.
-      // A garbled reply can look like an error, so stop only on a valid value read twice.
-      size_t index = fault_check;
-      int id = DXL_IDs[index];
-      fault_check = (fault_check + 1) % DXL_ID_CNT;
-      int32_t error = this->read_hardware_error(id);
-      if(error > 0)
-        error = (this->read_hardware_error(id) == error) ? error : 0;
-      if(error == 0x20 && auto_recover){
-        // Overload only: bring the motor back unless it keeps tripping (3 times in a minute)
-        int64_t now = esp_timer_get_time();
-        trips[index][2] = trips[index][1];
-        trips[index][1] = trips[index][0];
-        trips[index][0] = now;
-        bool too_often = trips[index][2] != 0 && now - trips[index][2] < 60000000;
-        if(!too_often){
-          ESP_LOGW("HK", "Motor %d overload: rebooting it and continuing", id);
-          this->_motor_report += "motor " + std::to_string(id) + " overload (recovered); ";
-          this->recover_motor(id, servo_profile_ms, servo_p_gain);
-          next = esp_timer_get_time();
-          continue;
-        }
-        ESP_LOGW("HK", "Motor %d overloaded 3 times in a minute", id);
-      }
-      if(error > 0){
-        ESP_LOGW("HK", "Motor %d hardware error 0x%02lx%s: stopping", id, (long) error, (error & 0x20) ? " (overload)" : "");
-        this->_motor_report += "homeokinesis stopped: motor " + std::to_string(id) + " hardware error; ";
-        this->go_to_rest_pose();
-        this->_hk_running = false;
-        this->hk_screen();
-        char msg[40];
-        snprintf(msg, sizeof(msg), "Motor %d fault: stopped", id);
-        this->tft_status(msg, ST77XX_RED);
-        next = esp_timer_get_time();
-        continue;
-      }
-
-      step_us_sum += step_us;
-      step_us_max = std::max(step_us_max, step_us);
-      if(++steps_in_log == CONFIG_CONTROL_FREQUENCY){
-        ESP_LOGI("HK", "step %ld: controller %lld us (max %lld), |y| %.2f, |C| %.2f, |A| %.2f, |error| %.3f, "
-                 "incomplete reads %d", this->_hk.steps(), step_us_sum / steps_in_log, step_us_max, y.norm(),
-                 this->_hk.C().norm(), this->_hk.A().norm(), this->_hk.prediction_error().norm(),
-                 this->_incomplete_reads);
-        step_us_sum = step_us_max = 0;
-        steps_in_log = 0;
-        this->_incomplete_reads = 0;
-      }
-    }
-
-    next += PERIOD;
-    int64_t wait = next - esp_timer_get_time();
-    if(wait > 0)
-      std::this_thread::sleep_for(std::chrono::microseconds(wait));
-    else
-      next = esp_timer_get_time(); // late: don't try to catch up
-  }
-
-  if(this->_hk_running)
-    this->go_to_rest_pose();
-  apply_pwm_limit(885); // full output again (at rest)
-  if(servo_profile_ms != 0 || servo_p_gain != 1600)
-    this->set_servo_motion(0, 1600); // back to what rollouts and the checkup expect
-  this->_hk_running = false;
-  this->_hk_active = false;
-  ESP_LOGI("HK", "Homeokinesis left, back to the menu");
-}
-
-Qutee::MenuChoice Qutee::menu(){
-  gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
-#if !QUTEE_THREE_BUTTONS
-  const char* items[] = {"Select Name", "Start Checkup", "Start ROS", "Homeokinesis"};
-  const uint16_t colors[] = {ST77XX_GREEN, ST77XX_RED, ST77XX_BLUE, ST77XX_YELLOW};
-  const size_t nb_items = 4;
-  size_t highlighted = 0;
-  while(!gpio_get_level(GPIO_NUM_0)) delay(10); // wait for the button to be released
-  while(1){
-    {
-      std::lock_guard<std::recursive_mutex> lock(this->_tft_lock);
-      this->_tft.setTextWrap(false);
-      this->_tft.fillScreen(ST77XX_BLACK);
-      this->_tft.setTextSize(2);
-      for(size_t i = 0; i < nb_items; i++){
-        this->_tft.setCursor(0, i * 30);
-        this->_tft.setTextColor(colors[i]);
-        this->_tft.print(i == highlighted ? "> " : "  ");
-        this->_tft.println(items[i]);
-      }
-    }
-    this->tft_status("Press: next   Hold: select");
-    ESP_LOGI("Menu", "Entering menu. Waiting for a button to be pressed");
-
-    if(!this->wait_button_press()){
-      highlighted = (highlighted + 1) % nb_items;
-      continue;
-    }
-    if(highlighted == 0)
-      this->select_name();
-    else if(highlighted == 1)
-      this->checkup(); // runs until the button is pressed
-    else if(highlighted == 2)
-      return MenuChoice::Ros;
-    else
-      return MenuChoice::Homeokinesis;
-  }
-#else
-  bool screen_on = false;
-  gpio_set_direction(GPIO_NUM_1, GPIO_MODE_INPUT);
-  gpio_set_direction(GPIO_NUM_2, GPIO_MODE_INPUT);
-
-  while(!gpio_get_level(GPIO_NUM_0) || gpio_get_level(GPIO_NUM_1) ||gpio_get_level(GPIO_NUM_2)){} // we loop as long as one button is pressed
-  
-  while(1){
-    if(!screen_on){
-      screen_on=true;
-      this->_tft.setTextWrap(false);
-      this->_tft.fillScreen(ST77XX_BLACK);
-      this->_tft.setTextSize(2);
-      
-      this->_tft.setCursor(0, 0);
-      this->_tft.setTextColor(ST77XX_GREEN);
-      this->_tft.println("Select Name");
-      
-      this->_tft.setCursor(0, 60);
-      this->_tft.setTextColor(ST77XX_RED);
-      this->_tft.println("Start Checkup");
-      
-      this->_tft.setCursor(0, 120);
-      this->_tft.setTextColor(ST77XX_BLUE);
-      this->_tft.println("Start ROS");
-
-      ESP_LOGI("Menu", "Entering menu. Waiting for a button to be pressed");
-    }
-
-    
-    delay(100);
-    if(!gpio_get_level(GPIO_NUM_0))
-      {
-	this->select_name();
-	screen_on=false; // set to false, to replot the screen when leaving calibration
-	
-      }
-    if(gpio_get_level(GPIO_NUM_1)){
-      this->checkup(); // runs until D0 is pressed
-      screen_on=false; // replot the menu
-    }
-    if(gpio_get_level(GPIO_NUM_2))
-      return MenuChoice::Ros; // the three-button menu has no homeokinesis entry
-
-  }
-#endif
 }

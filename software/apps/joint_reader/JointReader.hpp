@@ -1,7 +1,7 @@
 #ifndef JOINT_READER_HPP_
 #define JOINT_READER_HPP_
 
-// Joint reader: a minimal Qutee application (menuconfig: QUTEE settings -> Application). It turns the
+// Joint reader: a minimal Qutee application (./build.sh joint_reader). It turns the
 // motors' torque off so the legs can be moved by hand, starts ROS at boot (no menu), and publishes the
 // 12 joint positions. A simplified version of Qutee.hpp/.cpp: only the screen and the motors.
 

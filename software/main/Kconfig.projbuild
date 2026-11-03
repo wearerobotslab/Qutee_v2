@@ -1,17 +1,6 @@
 menu "QUTEE settings"
-
-    choice QUTEE_APP
-        prompt "Application"
-        default QUTEE_APP_FULL
-        help
-            Which firmware to build. Run idf.py reconfigure (or menuconfig) after changing it.
-
-        config QUTEE_APP_FULL
-            bool "Qutee: menu, ROS mode with rollouts, checkup, homeokinesis"
-
-        config QUTEE_APP_JOINT_READER
-            bool "Joint reader: ROS at boot, publishes the joint positions (software/joint_reader)"
-    endchoice
+    # The application (neural network, homeokinesis, joint reader) is chosen when building, not here:
+    # see software/build.sh. These settings are shared by all applications.
 
     config MICRO_ROS_APP_STACK
         int "Stack the micro-ROS app (Bytes)"
@@ -26,29 +15,17 @@ menu "QUTEE settings"
         Priority of micro-ros task higher value means higher priority
 
     config ROBOT_CTRL_APP_STACK
-        int "Stack the Robot Controll app (Bytes)"
+        int "Stack of the controller task (Bytes)"
         default 16000
         help
-        Stack size in Bytes of the Robot Controll app
+        Stack size in Bytes of the controller task (homeokinesis)
 
     config ROBOT_CTRL_APP_TASK_PRIO
-        int "Priority of the Robot Controll app"
+        int "Priority of the controller task"
         default 10
         help
-        Priority of  Robot Controll task higher value means higher priority
+        Priority of the controller task (homeokinesis): higher value means higher priority
 
-    config NB_HIDDEN_LAYERS 
-        int "Number of Hidden Layers in the neural network"
-        default 1
-        help
-        Number of Hidden Layers in the neural network
-
-
-    config NB_NEURONS_PER_LAYER
-        int "Number of neuron per hidden layer"
-        default 10
-        help
-        Number of neuron per hidden layer. Every hidden layer has the same size. 
     config QUTEE_NAME
         string "Name of the Qutee robot"
         default "qutee"
@@ -61,11 +38,25 @@ menu "QUTEE settings"
         help
         Control freqency for the Qutee
 
-    config EPISODE_DURATION
-        int "Duration of an episode in seconds"
-        default 5
-        help
-        Duration of an episode
+    menu "Neural network controller (apps/nn)"
+        config NB_HIDDEN_LAYERS
+            int "Number of Hidden Layers in the neural network"
+            default 1
+            help
+            Number of Hidden Layers in the neural network
+
+        config NB_NEURONS_PER_LAYER
+            int "Number of neuron per hidden layer"
+            default 10
+            help
+            Number of neuron per hidden layer. Every hidden layer has the same size.
+
+        config EPISODE_DURATION
+            int "Duration of an episode in seconds"
+            default 5
+            help
+            Duration of a rollout
+    endmenu
 
     config LEG_UP_ANGLE
         int "Leg angle that puts the torso on the ground (degrees)"
@@ -91,7 +82,7 @@ menu "QUTEE settings"
         default 8889
         range 0 65535
         help
-        In ROS mode, once WiFi is connected, the robot also sends its logs (starting with the
+        Once WiFi is connected (at boot), the robot also sends its logs (starting with the
         ones since boot) to the micro-ROS agent's IP on this UDP port. Read them with
         software/tools/wifi_monitor.py. Lines containing "password" are never sent.
 

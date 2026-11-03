@@ -1,4 +1,4 @@
-// Joint reader application (menuconfig: QUTEE settings -> Application -> Joint reader).
+// Joint reader application (build with QUTEE_APP=joint_reader: ./build.sh joint_reader).
 // At boot: motors with the torque off, WiFi, then ROS (retrying until the agent answers). Publishes
 //   /<robot name>/joint_states   sensor_msgs/JointState, 20 Hz: names "11".."43", positions in radians
 //                                (0 = the standing pose)

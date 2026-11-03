@@ -73,8 +73,19 @@ execute_process(
 )
 
 
-# Two applications share this component (menuconfig: QUTEE settings -> Application): the full Qutee firmware,
-# and the joint reader (../joint_reader: ROS at boot, publishes the joint positions, no menu).
+# The base robot (Qutee) is in this folder; the application chosen with -DQUTEE_APP (see ../CMakeLists.txt)
+# is in ../apps/<app>. All the .cpp files of the application's folder are compiled.
+set(app_dir "${CMAKE_CURRENT_LIST_DIR}/../apps/${QUTEE_APP}")
+if(QUTEE_APP)
+  file(GLOB app_srcs CONFIGURE_DEPENDS "${app_dir}/*.cpp")
+else()
+  set(app_srcs "") # ESP-IDF's first pass over the components only collects their requirements
+endif()
+if(QUTEE_APP STREQUAL "joint_reader")
+  set(robot_srcs "")  # the joint reader has its own small robot class
+else()
+  set(robot_srcs "Qutee.cpp" "QuteeNormalised.cpp")
+endif()
 set(shared_srcs "QuteeDxlPortHandler.cpp"
                 "udp_log.cpp"
                 "../components/Dynamixel2Arduino/src/Dynamixel2Arduino.cpp"
@@ -86,13 +97,8 @@ set(shared_srcs "QuteeDxlPortHandler.cpp"
                 "../components/Adafruit-ST7735-Library/Adafruit_ST7789.cpp"
                 "../components/Adafruit-ST7735-Library/Adafruit_ST7735.cpp"
                 "../components/Adafruit-ST7735-Library/Adafruit_ST77xx.cpp")
-if(CONFIG_QUTEE_APP_JOINT_READER)
-  set(app_srcs "../joint_reader/joint_reader_main.cpp" "../joint_reader/JointReader.cpp")
-else()
-  set(app_srcs "main.cpp" "Qutee.cpp")
-endif()
 
-idf_component_register(SRCS ${app_srcs} ${shared_srcs}
+idf_component_register(SRCS ${app_srcs} ${robot_srcs} ${shared_srcs}
                             "../components/Adafruit_Seesaw/Adafruit_Crickit.cpp"
                             "../components/Adafruit_Seesaw/Adafruit_miniTFTWing.cpp"
                             "../components/Adafruit_Seesaw/Adafruit_NeoKey_1x4.cpp"
@@ -108,7 +114,7 @@ idf_component_register(SRCS ${app_srcs} ${shared_srcs}
  
 
                     INCLUDE_DIRS "."
-                                "../joint_reader/"
+                                "../apps/${QUTEE_APP}/"
                                 "../components/Dynamixel2Arduino/src/."
                                 "../components/Dynamixel2Arduino/src/utility/." 
                                 "../components/Dynamixel2Arduino/src/dxl_c/."
@@ -117,7 +123,7 @@ idf_component_register(SRCS ${app_srcs} ${shared_srcs}
                                 "../components/Adafruit_Sensor/"
                                 "../components/Adafruit_BNO055/"
                                 "../components/Adafruit_MAX1704X/"
-                                "../components/intrinsic_motivations/cpp/homeokinesis/portable/"
+                                "../components/intrinsic_motivations/homeokinesis/cpp/portable/"
                  
 
 

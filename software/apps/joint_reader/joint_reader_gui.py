@@ -9,7 +9,6 @@ Works on Windows (Docker Desktop through WSL) and Linux (native Docker).
 """
 import csv
 import math
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -20,58 +19,11 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from qutee_docker import start_agent, start_rosbridge  # noqa: E402
+
 IDS = [11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43]
 JOINT_NAMES = {1: "hip (x1)", 2: "joint 2 (up/down)", 3: "knee (x3)"}
-WINDOWS = sys.platform == "win32"
-WSL_DISTRO = "Ubuntu"
-HERE = Path(__file__).resolve().parent
-
-
-# ----- Docker: the agent and rosbridge -----
-def docker(*args, timeout=300):
-    cmd = (["wsl", "-d", WSL_DISTRO, "--", "docker"] if WINDOWS else ["docker"]) + list(args)
-    flags = subprocess.CREATE_NO_WINDOW if WINDOWS else 0
-    try:
-        p = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=flags)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return 1, str(e)
-    return p.returncode, (p.stdout + p.stderr).decode("utf-8", errors="replace").replace("\x00", "").strip()
-
-
-def docker_path(path):
-    """On Windows Docker runs in WSL: \\\\wsl.localhost\\<distro>\\x -> /x, C:\\x -> /mnt/c/x."""
-    s = str(path)
-    if not WINDOWS:
-        return s
-    if s.lower().startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\")):
-        return "/" + "/".join(s.split("\\")[4:])
-    if len(s) > 2 and s[1] == ":":
-        return f"/mnt/{s[0].lower()}/" + s[3:].replace("\\", "/")
-    return s.replace("\\", "/")
-
-
-def start_container(name, run_args):
-    code, state = docker("inspect", "-f", "{{.State.Status}}", name)
-    if code == 0 and state == "running":
-        return f"{name} already running"
-    if code == 0:
-        return docker("start", name)[1] or f"{name} started"
-    return docker("run", "-d", "--name", name, *run_args)[1] or f"{name} started"
-
-
-def start_agent():
-    net = ["-p", "8888:8888/udp"] if WINDOWS else ["--net=host"]
-    return start_container("qutee_agent", [*net, "microros/micro-ros-agent:humble", "udp4", "--port", "8888"])
-
-
-def start_rosbridge():
-    if docker("image", "inspect", "qutee_rosbridge_basic")[0] != 0:
-        code, out = docker("build", "-t", "qutee_rosbridge_basic", "-f",
-                           docker_path(HERE / "rosbridge.Dockerfile"), docker_path(HERE), timeout=1200)
-        if code != 0:
-            return "building rosbridge failed: " + out[-300:]
-    net = ["-p", "9090:9090"] if WINDOWS else ["--net=host"]
-    return start_container("qutee_rosbridge_basic", [*net, "qutee_rosbridge_basic"])
 
 
 # ----- window -----

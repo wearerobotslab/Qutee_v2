@@ -1,14 +1,16 @@
 # Using the Qutee V2 robot (`qutier` branch)
 
-This guide covers building the firmware, flashing it, watching the robot's logs and starting it in ROS mode, on Windows and on Linux.
+This guide covers building the firmware, flashing it, watching the robot's logs and using it over ROS, on Windows and on Linux.
 
 > **Status: work in progress.**
 > - **Tested on Windows 11:** building the firmware, flashing and monitoring, boot, screen and menu, battery monitor, the motors and the checkup, the connection to the micro-ROS agent, and the `status` and `rollout` services.
+> - **Built but not tested on the robot yet:** the firmware split into applications (neural network, homeokinesis), with ROS started at boot (branch `qutier_split`).
 > - **Not tested yet:** the whole Linux section, and the IMU (our robot has none fitted).
 
 ## Contents
 - [Hardware](#hardware)
 - [Get the code](#get-the-code)
+- [The applications](#the-applications)
 - [Configure the firmware](#configure-the-firmware)
 - [Windows](#windows)
 - [Linux](#linux)
@@ -43,11 +45,23 @@ git submodule update --init --recursive
 
 All the commands below run from `Qutee_v2/software` unless stated otherwise.
 
+## The applications
+
+The firmware is one robot, `Qutee` (in `software/main`), plus one **application** chosen when building. Each application is its own binary; flash the one you want.
+
+| Application | Folder | What it does |
+|---|---|---|
+| `nn` | `software/apps/nn` | Neural network policy. Its weights come over ROS: the `rollout` service runs one episode and returns the states and actions. |
+| `homeokinesis` | `software/apps/homeokinesis` | The homeokinesis controller runs on the robot; start, stop and tune it over ROS or from the menu. |
+| `joint_reader` | `software/apps/joint_reader` | Torque off, publishes the joint positions, for reading the joint ranges by hand (see its README). |
+
+`Qutee` does what every application needs: it sets up the motors, the screen, the IMU and the battery monitor, moves slowly to the rest pose, connects to WiFi and starts ROS **at boot** (node `/<name>/qutee_node`, with the `status` service), and shows the [menu](#the-menu-boot-button). The `nn` and `homeokinesis` applications derive from it and add their controller, menu entries and ROS services or parameters. A new application is a new folder in `software/apps/` with a class derived from `Qutee` and an `app_main()` that calls `run()`.
+
 ## Configure the firmware
 
 The firmware is built in a Docker image (`qutee_idf`), on both Windows and Linux.
 
-Settings are changed with `idf.py menuconfig` inside the container (see the Windows or Linux section for how to open it). The ones that matter:
+Settings are changed with menuconfig, `./build.sh nn menuconfig` (any application name works: all applications share the same settings). The ones that matter:
 
 | Menu | Setting | What to set |
 |---|---|---|
@@ -59,8 +73,9 @@ Settings are changed with `idf.py menuconfig` inside the container (see the Wind
 | **QUTEE settings** | Turn the motors' torque off in the rest pose | Default on. Turn it off if the robot hangs on a stand, so the legs stay up. |
 | **QUTEE settings** | Duration of a slow move between poses | Default 1000 ms. |
 | **QUTEE settings** | UDP port for the logs over WiFi | Default 8889; 0 turns it off. See [Watch the logs over WiFi](#watch-the-logs-over-wifi). |
+| **QUTEE settings → Neural network controller** | Hidden layers, neurons per layer, episode duration | Used by the `nn` application. |
 
-Press **S** to save and **Q** to quit, then rebuild. After adding a new setting to `main/Kconfig.projbuild`, run `idf.py reconfigure` before building so that it appears in `sdkconfig`.
+Press **S** to save and **Q** to quit, then rebuild. After adding a new setting to `main/Kconfig.projbuild`, run `./build.sh <app> reconfigure` before building so that it appears in `sdkconfig`.
 
 The settings are saved in `software/sdkconfig`, which git ignores, so your WiFi password is not committed. Do not put your own WiFi details in `sdkconfig.defaults`, which is committed.
 
@@ -104,27 +119,23 @@ Add `--no-cache` after changing the Dockerfile.
 
 ### Configure and build the firmware
 
-In a WSL terminal, from `software/`, open a shell in the container:
+In a WSL terminal, from `software/`, build the [application](#the-applications) you want with `build.sh`, which runs `idf.py` in the container:
 
 ```bash
-docker run -it --rm --user espidf -v "$(pwd)":/micro_ros_espidf_component -w /micro_ros_espidf_component qutee_idf bash
+./build.sh nn menuconfig      # only when you need to change settings
+./build.sh nn                 # -> build/nn/qutee_nn.bin
+./build.sh homeokinesis       # -> build/homeokinesis/qutee_homeokinesis.bin
 ```
 
-You must be in `software/` when you run this, because `$(pwd)` is the folder that gets mounted. Keep the mount path `/micro_ros_espidf_component`, which the build scripts expect. Then, inside the container:
+A successful build ends with `Successfully created esp32s3 image`. Each application has its own build folder, `build/<app>`, so switching between them doesn't rebuild everything. The first build compiles micro-ROS from source and takes a long time; later builds take a minute or two.
+
+`./build.sh <app> <command>` runs any other `idf.py` command for that application (for example `fullclean`). Without the script, the container command is:
 
 ```bash
-. $IDF_PATH/export.sh
-idf.py menuconfig    # only when you need to change settings
-idf.py build
+docker run --rm --user espidf -v "$(pwd)":/micro_ros_espidf_component -w /micro_ros_espidf_component qutee_idf bash -lc '. $IDF_PATH/export.sh && idf.py -B build/nn -DQUTEE_APP=nn build'
 ```
 
-A successful build ends with `Successfully created esp32s3 image` and produces `build/QuteeV2.bin`. The first build compiles micro-ROS from source and takes a long time; later builds take a minute or two.
-
-To build in one step without entering the container:
-
-```bash
-docker run --rm --user espidf -v "$(pwd)":/micro_ros_espidf_component -w /micro_ros_espidf_component qutee_idf bash -lc '. $IDF_PATH/export.sh && idf.py build'
-```
+You must be in `software/`, because `$(pwd)` is the folder that gets mounted. Keep the mount path `/micro_ros_espidf_component`, which the build scripts expect.
 
 ### Flash
 
@@ -135,12 +146,14 @@ conda activate robot
 python -m serial.tools.list_ports -v
 ```
 
-Then, from the build folder (the WSL path works directly from Windows):
+Then, from the application's build folder (the WSL path works directly from Windows), for example the neural network:
 
 ```powershell
-cd \\wsl.localhost\Ubuntu\home\<user>\Qutee_v2\software\build
-python -m esptool --chip esp32s3 -p COM3 -b 460800 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 40m --flash-size 4MB 0x0 bootloader\bootloader.bin 0x8000 partition_table\partition-table.bin 0x10000 QuteeV2.bin
+cd \\wsl.localhost\Ubuntu\home\<user>\Qutee_v2\software\build\nn
+python -m esptool --chip esp32s3 -p COM3 -b 460800 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 40m --flash-size 4MB 0x0 bootloader\bootloader.bin 0x8000 partition_table\partition-table.bin 0x10000 qutee_nn.bin
 ```
+
+For homeokinesis, use `build\homeokinesis` and `qutee_homeokinesis.bin`.
 
 - If esptool can't connect: hold **Boot**, press and release **Reset**, release **Boot**, and try again (the port number may change in this mode). Press **Reset** after flashing.
 - esptool v5 uses hyphenated names (`write-flash`, `default-reset`). Older versions print deprecation warnings for the underscore names but still work.
@@ -149,7 +162,7 @@ python -m esptool --chip esp32s3 -p COM3 -b 460800 --before default-reset --afte
 ### Watch the logs
 
 ```powershell
-python ..\tools\serial_monitor.py COM3
+python ..\..\tools\serial_monitor.py COM3
 ```
 
 `software/tools/serial_monitor.py` reconnects automatically when the board resets (the Feather's USB port disappears for a moment on every reset) and shows the log colours. Quit with **Ctrl+C**, **Ctrl+X** or **q**.
@@ -165,10 +178,10 @@ If you use pyserial's `miniterm` instead, add `--exit-char 24` so **Ctrl+X** qui
 To run the robot without the USB cable, read its logs over WiFi instead:
 
 ```powershell
-python ..\tools\wifi_monitor.py
+python ..\..\tools\wifi_monitor.py
 ```
 
-Run it on the computer whose IP is the micro-ROS Agent IP (it needs the firewall rule for UDP 8889, see [One-time setup](#one-time-setup)). The robot only joins WiFi in ROS mode: when you choose **Start ROS**, the monitor shows `Receiving from <robot IP>`, then the logs since the robot was switched on (it keeps the last 16 KB until WiFi connects), then the live logs. It needs only Python's standard library and quits at once with **Ctrl+C**, **Ctrl+X** or **q**. Lines containing "password" are never sent over the network.
+Run it on the computer whose IP is the micro-ROS Agent IP (it needs the firewall rule for UDP 8889, see [One-time setup](#one-time-setup)). The robot joins WiFi at boot, once it has moved to the rest pose: the monitor then shows `Receiving from <robot IP>`, then the logs since the robot was switched on (it keeps the last 16 KB until WiFi connects), then the live logs. It needs only Python's standard library and quits at once with **Ctrl+C**, **Ctrl+X** or **q**. Lines containing "password" are never sent over the network.
 
 ### Run the micro-ROS agent
 
@@ -178,10 +191,10 @@ In a WSL terminal, start it in the background with a name:
 docker run -d --name qutee_agent -p 8888:8888/udp microros/micro-ros-agent:humble udp4 --port 8888 -v6
 ```
 
-- Watch it with `docker logs -f --tail 50 qutee_agent` (Ctrl+C stops watching, not the agent). When the robot connects you see `session established` and two `replier created` lines (the `status` and `rollout` services).
+- Watch it with `docker logs -f --tail 50 qutee_agent` (Ctrl+C stops watching, not the agent). When the robot connects you see `session established` and `replier created` lines (the `status` service, the parameter server's services and, for `nn`, `rollout`).
 - Stop it with `docker stop qutee_agent`; start it again with `docker start qutee_agent`.
 - Only one agent can use port 8888. `port is already allocated` means one is already running: check with `docker ps`.
-- The agent can keep running while you reset the robot: the robot reconnects with the same client key and the agent replaces its old session.
+- The agent can keep running while you reset the robot: the robot reconnects with the same client key and the agent replaces its old session. Each application uses its own client key, so switching between them doesn't mix up their services.
 - Use `-p 8888:8888/udp`, not `--net=host`. On Windows, Docker Desktop's host networking makes the robot's packets appear to come from `127.0.0.1`, so the agent's replies never reach the robot ("Agent unreachable" on the screen).
 
 ## Linux
@@ -212,12 +225,12 @@ docker run -it --rm --user espidf -v "$(pwd)":/micro_ros_espidf_component -v /de
 
 ```bash
 . $IDF_PATH/export.sh
-idf.py menuconfig                    # only when you need to change settings
-idf.py build
-idf.py -p /dev/ttyACM0 flash
+idf.py -B build/nn -DQUTEE_APP=nn menuconfig      # only when you need to change settings
+idf.py -B build/nn -DQUTEE_APP=nn build           # or QUTEE_APP=homeokinesis, see The applications
+idf.py -B build/nn -p /dev/ttyACM0 flash
 ```
 
-You can also flash from the host instead, with `pip install esptool` and the same esptool command as in the Windows section, using `-p /dev/ttyACM0` and `/` in the paths.
+You can also build with `./build.sh nn` on the host, and flash from the host instead, with `pip install esptool` and the same esptool command as in the Windows section, using `-p /dev/ttyACM0` and `/` in the paths.
 
 ### Watch the logs
 
@@ -256,7 +269,7 @@ The screen shows "Hi! My name is ... Loading!", then a status line along the bot
 | Setting up motors... | Configuring the 12 motors. Takes about 10 s when they don't answer. |
 | Motors found: N/12 | Green if all 12 answer, yellow otherwise. |
 
-The same information, in more detail, is in the serial log. The robot then settles into its [rest pose](#poses): it raises its legs so the torso comes down onto the ground, lowers them to the rest pose, and turns the motors' torque off.
+The same information, in more detail, is in the serial log. The robot then settles into its [rest pose](#poses): it raises its legs so the torso comes down onto the ground, lowers them to the rest pose, and turns the motors' torque off. Then it connects to WiFi and the agent (see [ROS](#ros)) and shows the [menu](#the-menu-boot-button).
 
 ### Poses
 
@@ -277,28 +290,36 @@ The robot never jumps between poses: every change is a smooth move of about 1 s 
 | Short press | Move the `>` marker to the next option. |
 | Long press (about 0.7 s, "Selected" appears) | Choose the option. |
 
-Options:
-- **Select Name**: pick the robot's name from the list set in menuconfig (short press: next name, long press: choose). The choice is remembered across reboots. Until a name is chosen, the robot uses the first name in the list.
-- **Start Checkup**: stands up, then moves all motors in a slow sine wave and shows each motor's average position error, one row per leg and one column per joint. Values above 0.1 are red. Hold **Boot** until the menu comes back to stop it; the robot then goes back to rest.
-- **Start ROS**: connects to WiFi and the micro-ROS agent. You can't go back to the menu from ROS mode; press **Reset**.
-- **Homeokinesis**: connects to WiFi and the agent (if not already connected), stands up and runs the homeokinesis controller (see [Homeokinesis](#homeokinesis)). Short press: stop (rest) or start again. Long press: back to the menu, without restarting (WiFi and ROS stay connected).
+The menu stays on the screen while the robot runs; ROS works at the same time. The application's entries come first, then the robot's own:
+- **Start homeokinesis** / **Stop homeokinesis** (`homeokinesis` only): see [Homeokinesis](#homeokinesis).
+- **Select Name**: pick the robot's name from the list set in menuconfig (short press: next name, long press: choose). The choice is remembered across reboots and, since the name is the ROS namespace, used after the next restart. Until a name is chosen, the robot uses the first name in the list.
+- **Checkup**: stands up, then moves all motors in a slow sine wave and shows each motor's average position error, one row per leg and one column per joint. Values above 0.1 are red. Press **Boot** to stop it; the robot then goes back to rest.
+- **Calibrate IMU** (only with an IMU fitted): move the robot until the IMU reports full calibration, then keep it still for 1 s; the calibration is saved and loaded at every boot. Press **Boot** to cancel.
 
-### ROS mode
+Only one thing moves the motors at a time: a rollout, the checkup or homeokinesis. Starting another meanwhile is refused (the screen shows "Busy: … is running", and `status` reports it in `error_message`).
 
-The screen shows the robot's name and "ROS mode", and the status line shows:
+### ROS
 
-| Status line | Meaning |
+ROS starts at boot. The ROS line, just above the status line at the bottom of the screen, shows:
+
+| ROS line | Meaning |
 |---|---|
 | Connecting to WiFi `<SSID>` | |
 | WiFi connected, IP `x.x.x.x` | |
 | WiFi failed: check SSID/password | Fix the settings in menuconfig, rebuild and flash. |
 | Connecting to agent `<IP>:<port>` | |
-| Connected to agent, ready | The robot's services are available. |
-| Agent unreachable: start it, then reset | Start the agent (and check the IP, firewall and networking), then press **Reset**. |
+| Agent unreachable, retrying... | The robot retries every 2 s, so start the agent (and check the IP, firewall and networking); no reset needed. Meanwhile the menu works. |
+| ROS ready: /`<name>`/qutee_node | The robot's services and parameters are available. |
 
-When connected, the robot offers two services under its name (for example `/qutee/status` and `/qutee/rollout`):
-- **status**: battery voltage, number of policy weights, and `error_message`: motor problems found during the last rollout (empty if none, see [Motor faults during rollouts](#motor-faults-during-rollouts)).
-- **rollout**: runs one episode (`EPISODE_DURATION` seconds at `CONTROL_FREQUENCY` Hz, both in menuconfig) with the neural network weights you send, and returns the states and actions.
+Every application offers, under the robot's name (for example `/qutee/status`):
+- **status** service: battery voltage, number of policy weights (0 without a neural network), and `error_message`: motor problems found during the last rollout or homeokinesis run (empty if none, see [Motor faults during rollouts](#motor-faults-during-rollouts)).
+- **torque_off_at_rest** parameter of `/qutee/qutee_node`.
+- **joint_states** topic (`/qutee/joint_states`, `sensor_msgs/JointState`, 20 Hz, best effort): the 12 joint positions, names `"11"`...`"43"` (motor IDs), in **radians** from the standing pose. Time stamps come from the agent's clock. While a rollout, the checkup or homeokinesis runs, these are the positions it reads; otherwise the robot reads them itself. During a rollout it pauses while the robot stands up and goes back to rest (about 2 s each, no position reads then), and publishes during the episode itself. Read it with `ros2 topic echo /qutee/joint_states` (add `--qos-reliability best_effort` if nothing shows).
+
+The `nn` application adds:
+- **rollout** service: runs one episode (`EPISODE_DURATION` seconds at `CONTROL_FREQUENCY` Hz, both in menuconfig) with the neural network weights you send, and returns the states and actions.
+
+The `homeokinesis` application adds its [parameters](#homeokinesis).
 
 ### Calling the services
 
@@ -314,13 +335,13 @@ On Linux, add `--net=host` (the agent runs with `--net=host` there). On Windows,
 source /opt/ros/humble/setup.bash
 cd /ws && colcon build --packages-select qutee_interface
 source install/setup.bash
-ros2 service list                                           # shows /qutee/rollout and /qutee/status
+ros2 service list                                           # shows /qutee/status (and /qutee/rollout with nn)
 ros2 service call /qutee/status qutee_interface/srv/Status
 ```
 
 The status reply looks like `Status_Response(battery=5.15, number_weights=322, error_message='')`. If `ros2 service list` shows nothing just after starting the container, wait a few seconds for ROS 2 discovery and try again.
 
-To run a rollout, send the weights from Python (the `ros:humble` image includes numpy). **The legs move**: put the robot on a stand the first time.
+To run a rollout (`nn` application), send the weights from Python (the `ros:humble` image includes numpy). **The legs move**: put the robot on a stand the first time.
 
 ```bash
 python3 - <<'EOF'
@@ -358,9 +379,21 @@ Large weights (for example ±1) make the joints swing between ±45° at full spe
 
 ## Homeokinesis
 
-Homeokinesis is a self-organising controller ("Sox", from The Playful Machine, Der and Martius, 2012): it learns a model of how its commands move the joints and continually adapts its controller to stay at the edge of instability, so movement emerges by itself. It runs on the robot, at 50 Hz, with the 12 joint positions as sensors and the 12 joint targets as outputs. The code is the portable C++ version in the `intrinsic_motivations` submodule (`software/components/intrinsic_motivations/cpp/homeokinesis/portable`).
+Homeokinesis is a self-organising controller ("Sox", from The Playful Machine, Der and Martius, 2012): it learns a model of how its commands move the joints and continually adapts its controller to stay at the edge of instability, so movement emerges by itself. It runs on the robot, at 50 Hz, with the 12 joint positions as sensors and the 12 joint targets as outputs. The controller is the portable C++ version in the `intrinsic_motivations` submodule (`software/components/intrinsic_motivations/homeokinesis/cpp/portable`); the application is `software/apps/homeokinesis` (flash `qutee_homeokinesis.bin`).
 
-**Start:** choose **Homeokinesis** in the menu, on the floor. **Stop:** short press (the robot goes to rest; press again to restart), or `ros2 param set /qutee/qutee_node running false`. **Leave:** long press, back to the menu. While homeokinesis is chosen, `rollout` is refused.
+**Normalised joints:** the controller works in [-1, 1] for every joint, mapped to a movement range (`QuteeNormalised`, in `software/main`). The range is "walking": hips -45° to 45°, joints 2 -45° to 45°, knees 0° to 90° (forward). So 0 is the centre of each range (knees at 45°), and a hip given 1 goes to 45°. Targets are clipped to the range; the sensors use the same scale and can read beyond ±1 when a joint is outside it.
+
+**Start**, on the floor: choose **Start homeokinesis** in the menu, or `ros2 param set /qutee/qutee_node running true`. The robot stands up, moves slowly to the centre of the range (knees forward to 45°), and the controller starts. **Stop:** **Stop homeokinesis** in the menu, or `running false`: the robot goes back to rest. You can start and stop it as often as you like, without restarting the robot.
+
+**GUI:** `software/apps/homeokinesis/homeokinesis_gui.py` starts, stops and resets the controller, shows and changes every parameter (read from the robot), saves and loads sets of values (JSON), and shows the joint positions in degrees and normalised. It needs PySide6 and roslibpy (the `qutee_gui` conda environment on Windows):
+
+```powershell
+conda activate qutee_gui
+cd \\wsl.localhost\Ubuntu\home\<user>\Qutee_v2\software\apps\homeokinesis
+python homeokinesis_gui.py          # or: python homeokinesis_gui.py <robot name>
+```
+
+Click **Start agent** and **Start rosbridge** (the first start builds the rosbridge image: a few minutes), then **Connect**. Only one rosbridge can use port 9090: stop another one first (`docker stop qutee_rosbridge`).
 
 **Parameters**, from a ROS 2 shell (a WSL terminal on Windows; add `--net=host` on Linux):
 
@@ -376,17 +409,17 @@ ros2 param load /qutee/qutee_node /params/good.yaml          # restore it (the r
 | Parameter | Default | What it does |
 |---|---|---|
 | `eps_C`, `eps_A` | 0.5, 0.5 | Learning rates of the controller and the model. The learning keeps the robot moving: with them at 0, it stops. |
-| `amplitude` | 0.8 | Joint targets = output × amplitude (1 = ±45°). |
-| `sensor_noise`, `motor_noise` | 0.05, 0.05 | Uniform white noise in [-n, n] (1 = 45°) added to each joint reading and to each output. Homeokinesis amplifies fluctuations; the servos are too precise to provide them, so without noise the robot may need a push to start. |
+| `amplitude` | 0.8 | Joint targets = output × amplitude, in normalised units (1 = the whole range). |
+| `sensor_noise`, `motor_noise` | 0.05, 0.05 | Uniform white noise in [-n, n], normalised (1 = half a joint's range, 45° in "walking"), added to each joint reading and to each output. Homeokinesis amplifies fluctuations; the servos are too precise to provide them, so without noise the robot may need a push to start. |
 | `servo_p_gain` | 400 | Servo stiffness while homeokinesis runs (rollouts and poses use 1600). Softer means fewer overloads. |
 | `servo_profile_ms` | 20 | Time each servo takes to reach a new target (0 = as fast as possible): smoother movement and lower current peaks. |
-| `servo_pwm_limit` | 700 | Maximum output of each motor (0 to 885 = 100%), to make overloads rarer. Set at rest with the torque off, so it also applies while standing up; changing it while running pauses homeokinesis (rest, change, stand up). Back to 885 when homeokinesis ends and at boot. |
+| `servo_pwm_limit` | 700 | Maximum output of each motor (0 to 885 = 100%), to make overloads rarer. Set at rest with the torque off, so it also applies while standing up; changing it while running pauses homeokinesis (rest, change, stand up). It stays set when homeokinesis stops (also for the checkup), to spare the motors' EEPROM; back to 885 at boot. |
 | `auto_recover` | true | On an overload, reboot only that motor, let it cool down 2 s and continue. A motor that overloads 3 times within a minute, or any other fault, stops homeokinesis. |
 | `motor_smoothing` | 0 | Filters the targets (0 to 0.99). |
 | `creativity`, `harmony`, `damping`, `causeaware` | 0.1, 0.1, 1e-5, 0.01 | Further Sox parameters. |
 | `steps_delay`, `steps_averaging` | 10 (used as 9) | Delay between a command and its effect, and sensor smoothing, in steps (1 to 9). |
 | `torque_off_at_rest` | menuconfig | Turn off when the robot hangs on a stand: there the released legs fall and the knees can trip. |
-| `running`, `reset` | | Start/stop; `reset true` clears what the controller has learned. |
+| `running`, `reset` | | Start/stop (follows the menu too); `reset true` clears what the controller has learned. |
 
 The defaults were tuned on the floor; they reset whenever the robot restarts, so save good values with `ros2 param dump` and load them after a start.
 
@@ -410,9 +443,10 @@ When all 12 are set, the boot screen should show "Motors found: 12/12".
 |---|---|
 | `CMakeLists.txt not found in project directory` | You started the container outside `software/`. Exit and `cd` there first. |
 | micro-ROS build fails in `builtin_interfaces` | The Docker image is old. Rebuild it with `--no-cache` (the Dockerfile installs `lark` and `"empy<4"`). |
-| Build fails after an earlier failure | Clean the build output (from `software/`, in WSL or Linux): `sudo rm -rf build main/build main/install main/log main/include main/libquteeinterface.a managed_components components/micro_ros_espidf_component/micro_ros_* components/micro_ros_espidf_component/include components/micro_ros_espidf_component/libmicroros.a` |
+| `Choose the application with -DQUTEE_APP=<app>` | Build with `./build.sh <app>` (see [The applications](#the-applications)), not plain `idf.py build`. |
+| Build fails after an earlier failure | Clean the build output (from `software/`, in WSL or Linux; this removes every application's build): `sudo rm -rf build main/build main/install main/log main/include main/libquteeinterface.a managed_components components/micro_ros_espidf_component/micro_ros_* components/micro_ros_espidf_component/include components/micro_ros_espidf_component/libmicroros.a` |
 | Screen stays black | Firmware built for the wrong board. Check `CONFIG_ARDUINO_VARIANT` in `sdkconfig` (see the next section). |
-| Serial monitor shows nothing | The robot is waiting in the menu, which only logs once. Press **Reset** with the monitor running. |
+| Serial monitor shows nothing | The robot is waiting in the menu, which only logs once. Press **Reset** with the monitor running, or use [the logs over WiFi](#watch-the-logs-over-wifi), which start with the boot logs. |
 | `task_wdt: Task watchdog got triggered` during "Setting up motors" | The motors aren't answering; the library keeps the CPU busy while it waits. Harmless, but see [Setting up the motors](#setting-up-the-motors). |
 | A motor's LED blinks red | The motor has a hardware error and has turned its torque off. The most common cause is powering the robot through USB with the battery off: the Feather's charger then feeds the motors through VBAT at too low a voltage. At boot the firmware waits for the battery and reboots motors with an error, logging each motor's voltage and error bits (`input-voltage`, `overheating`, `encoder`, `electrical-shock`, `overload`). If it comes back, read **Hardware Error Status** (address 70) in Dynamixel Wizard. |
 | Motors turn red when the robot goes to rest | The legs were still carrying the robot when the torque turned off. Increase "Leg angle of the rest pose" until the torso rests on the ground first (see [Poses](#poses)). |
@@ -421,7 +455,7 @@ When all 12 are set, the boot screen should show "Motors found: 12/12".
 | `Detected size(4096k) larger than the size in the binary image header(2048k)` | Firmware from before the homeokinesis branch, which used 2 MB of the 4 MB flash. Harmless. The current firmware uses all 4 MB (flash with `--flash-size 4MB`). |
 | After flashing, `ros2 param get` times out, or some of the robot's services are missing | The new firmware creates different services, and the agent reused the old ones by number (the robot reconnects with the same client key). Restart the agent once: `docker restart qutee_agent`, then reset the robot. |
 | Robot can't reach the agent from Windows | Check mirrored networking (`hostname -I` in WSL shows the Windows IP), the firewall rule, that the WiFi network is Private, the Agent IP in menuconfig, and that the agent runs with `-p 8888:8888/udp` (not `--net=host`). |
-| `ros2 service list` doesn't show the robot's services | Check that the robot shows "Connected to agent, ready" and that the agent's log (`docker logs qutee_agent`) shows two `replier created` lines for its session. |
+| `ros2 service list` doesn't show the robot's services | Check that the robot shows "ROS ready" and that the agent's log (`docker logs qutee_agent`) shows `replier created` lines for its session. |
 
 ## Building for the Reverse TFT Feather
 
@@ -431,4 +465,4 @@ The upstream Qutee V2 uses the **ESP32-S3 Reverse TFT Feather**, which has three
 CONFIG_ARDUINO_VARIANT="adafruit_feather_esp32s3_reversetft"
 ```
 
-The firmware then uses the original three-button menu: D0 = Select Name, D1 = Start Checkup, D2 = Start ROS. In the name list, D0 = up, D1 = select, D2 = down. D0 also exits the checkup.
+The menu then uses the three buttons: D0 = previous entry, D1 = select, D2 = next entry, also in the name list. Any button stops the checkup.
