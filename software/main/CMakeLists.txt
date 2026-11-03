@@ -73,19 +73,26 @@ execute_process(
 )
 
 
-idf_component_register(SRCS "main.cpp"
-                            "Qutee.cpp"       
-                            "QuteeDxlPortHandler.cpp"
-                            "udp_log.cpp"
-                            "../components/Dynamixel2Arduino/src/Dynamixel2Arduino.cpp" 
-                            "../components/Dynamixel2Arduino/src/actuator.cpp" 
-                            "../components/Dynamixel2Arduino/src/utility/master.cpp" 
-                            "../components/Dynamixel2Arduino/src/utility/port_handler.cpp" 
-                            "../components/Dynamixel2Arduino/src/utility/slave.cpp" 
-                            "../components/Dynamixel2Arduino/src/dxl_c/protocol.c"
-                            "../components/Adafruit-ST7735-Library/Adafruit_ST7789.cpp"
-                            "../components/Adafruit-ST7735-Library/Adafruit_ST7735.cpp"
-                            "../components/Adafruit-ST7735-Library/Adafruit_ST77xx.cpp"
+# Two applications share this component (menuconfig: QUTEE settings -> Application): the full Qutee firmware,
+# and the joint reader (../joint_reader: ROS at boot, publishes the joint positions, no menu).
+set(shared_srcs "QuteeDxlPortHandler.cpp"
+                "udp_log.cpp"
+                "../components/Dynamixel2Arduino/src/Dynamixel2Arduino.cpp"
+                "../components/Dynamixel2Arduino/src/actuator.cpp"
+                "../components/Dynamixel2Arduino/src/utility/master.cpp"
+                "../components/Dynamixel2Arduino/src/utility/port_handler.cpp"
+                "../components/Dynamixel2Arduino/src/utility/slave.cpp"
+                "../components/Dynamixel2Arduino/src/dxl_c/protocol.c"
+                "../components/Adafruit-ST7735-Library/Adafruit_ST7789.cpp"
+                "../components/Adafruit-ST7735-Library/Adafruit_ST7735.cpp"
+                "../components/Adafruit-ST7735-Library/Adafruit_ST77xx.cpp")
+if(CONFIG_QUTEE_APP_JOINT_READER)
+  set(app_srcs "../joint_reader/joint_reader_main.cpp" "../joint_reader/JointReader.cpp")
+else()
+  set(app_srcs "main.cpp" "Qutee.cpp")
+endif()
+
+idf_component_register(SRCS ${app_srcs} ${shared_srcs}
                             "../components/Adafruit_Seesaw/Adafruit_Crickit.cpp"
                             "../components/Adafruit_Seesaw/Adafruit_miniTFTWing.cpp"
                             "../components/Adafruit_Seesaw/Adafruit_NeoKey_1x4.cpp"
@@ -100,7 +107,9 @@ idf_component_register(SRCS "main.cpp"
                             "../components/Adafruit_MAX1704X/Adafruit_MAX1704X.cpp"
  
 
-                    INCLUDE_DIRS "../components/Dynamixel2Arduino/src/." 
+                    INCLUDE_DIRS "."
+                                "../joint_reader/"
+                                "../components/Dynamixel2Arduino/src/."
                                 "../components/Dynamixel2Arduino/src/utility/." 
                                 "../components/Dynamixel2Arduino/src/dxl_c/."
                                 "../components/Adafruit-ST7735-Library/"

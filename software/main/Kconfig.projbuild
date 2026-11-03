@@ -1,5 +1,18 @@
 menu "QUTEE settings"
 
+    choice QUTEE_APP
+        prompt "Application"
+        default QUTEE_APP_FULL
+        help
+            Which firmware to build. Run idf.py reconfigure (or menuconfig) after changing it.
+
+        config QUTEE_APP_FULL
+            bool "Qutee: menu, ROS mode with rollouts, checkup, homeokinesis"
+
+        config QUTEE_APP_JOINT_READER
+            bool "Joint reader: ROS at boot, publishes the joint positions (software/joint_reader)"
+    endchoice
+
     config MICRO_ROS_APP_STACK
         int "Stack the micro-ROS app (Bytes)"
         default 16000
